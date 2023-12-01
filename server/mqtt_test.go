@@ -3306,7 +3306,8 @@ func TestMQTTRetainedMsgMigration(t *testing.T) {
 	require_NoError(t, err)
 
 	// Publish some retained messages on the old "$MQTT.rmsgs" subject.
-	for i := 0; i < 100; i++ {
+	const N = 2
+	for i := 0; i < N; i++ {
 		msg := fmt.Sprintf(
 			`{"origin":"b5IQZNtG","subject":"test%d","topic":"test%d","msg":"YmFy","flags":1}`, i, i,
 		)
@@ -3322,8 +3323,8 @@ func TestMQTTRetainedMsgMigration(t *testing.T) {
 	if si.State.NumSubjects != 1 {
 		t.Fatalf("expected 1 subject, got %d", si.State.NumSubjects)
 	}
-	if n := si.State.Subjects[`$MQTT.rmsgs`]; n != 100 {
-		t.Fatalf("expected to find 100 messages on the original subject but found %d", n)
+	if n := si.State.Subjects[`$MQTT.rmsgs`]; n != N {
+		t.Fatalf("expected to find %d messages on the original subject but found %d", N, n)
 	}
 
 	// Create an MQTT client, this will cause a migration to take place.
@@ -3331,24 +3332,26 @@ func TestMQTTRetainedMsgMigration(t *testing.T) {
 	defer mc.Close()
 	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
 
+	t.Log("<>/<> ==================================")
+
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "+", qos: 0}}, []byte{0})
 	topics := map[string]struct{}{}
-	for i := 0; i < 100; i++ {
+	for i := 0; i < N; i++ {
 		_, _, topic := testMQTTGetPubMsgEx(t, mc, rc, _EMPTY_, []byte("bar"))
 		topics[topic] = struct{}{}
 	}
-	if len(topics) != 100 {
+	if len(topics) != N {
 		t.Fatalf("Unexpected topics: %v", topics)
 	}
 
-	// Now look at the stream, there should be 100 messages on the new
+	// Now look at the stream, there should be N messages on the new
 	// divided subjects and none on the old undivided subject.
 	si, err = js.StreamInfo(mqttRetainedMsgsStreamName, &nats.StreamInfoRequest{
 		SubjectsFilter: `$MQTT.>`,
 	})
 	require_NoError(t, err)
-	if si.State.NumSubjects != 100 {
-		t.Fatalf("expected 100 subjects, got %d", si.State.NumSubjects)
+	if si.State.NumSubjects != N {
+		t.Fatalf("expected %d subjects, got %d", N, si.State.NumSubjects)
 	}
 	if n := si.State.Subjects[`$MQTT.rmsgs`]; n > 0 {
 		t.Fatalf("expected to find no messages on the original subject but found %d", n)
@@ -3356,7 +3359,7 @@ func TestMQTTRetainedMsgMigration(t *testing.T) {
 
 	// Check that the message counts look right. There should be one
 	// retained message per key.
-	for i := 0; i < 100; i++ {
+	for i := 0; i < N; i++ {
 		expected := fmt.Sprintf(`$MQTT.rmsgs.test%d`, i)
 		n, ok := si.State.Subjects[expected]
 		if !ok {

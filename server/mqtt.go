@@ -1580,10 +1580,12 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 	r2i := map[string]int{}
 	for i, msg := range msgs {
 		hdr := hdrs[i]
+		fmt.Printf("<>/<> 1 hdr: %v, msg: %s-----\n", hdr, msg)
 		reply := jsa.queueRequest(kind, subject, cidHash, hdr, msg, responseCh)
 		r2i[reply] = i
 	}
 
+	fmt.Printf("<>/<> 2 r2i: %v\n", r2i)
 	// Wait for all responses to come back, or for the timeout to expire. We
 	// don't want to use time.After() which causes memory growth because the
 	// timer can't be stopped and will need to expire to then be garbage
@@ -1597,10 +1599,10 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 		case r := <-responseCh:
 			i := r2i[r.reply]
 			responses[i] = r.value
-
+			fmt.Printf("<>/<> 3 r: %v\n", r)
+			fmt.Printf("<>/<> 4 r.value: %v\n", r.value)
 			if len(responses) == len(msgs) {
-				// Ensure we stop the timer so it can be quickly garbage collected.
-				t.Stop()
+				fmt.Printf("<>/<> 5 responses: %v\n", responses)
 				return responses, nil
 			}
 
@@ -1617,7 +1619,7 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 			if len(msgs) == 1 {
 				return nil, fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, subject, reply)
 			} else {
-				return nil, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, subject, c, len(msgs))
+				return nil, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, subject, len(responses), len(msgs))
 			}
 		}
 	}
@@ -1852,8 +1854,10 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	jsa.replies.Delete(subject)
 	ch := chi.(chan *mqttJSAResponse)
 	out := func(v any) {
+		fmt.Printf("<>/<> SENDING: %v\n", v)
 		ch <- &mqttJSAResponse{reply: subject, value: v}
 	}
+		fmt.Printf("<>/<> TOKEN: %q\n", token)
 	switch token {
 	case mqttJSAStreamCreate:
 		var resp = &JSApiStreamCreateResponse{}
@@ -1898,11 +1902,14 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 		}
 		out(resp)
 	case mqttJSAMsgLoad:
-		var resp = &JSApiMsgGetResponse{}
-		if err := json.Unmarshal(msg, resp); err != nil {
+		fmt.Printf("<>/<> message load: %s\n", msg)
+		var resp = JSApiMsgGetResponse{}
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			fmt.Printf("<>/<> message ERROR: %v\n", err)
 			resp.Error = NewJSInvalidJSONError()
 		}
-		out(resp)
+		fmt.Printf("<>/<> message out: %v\n", resp)
+		out(&resp)
 	case mqttJSAStreamNames:
 		var resp = &JSApiStreamNamesResponse{}
 		if err := json.Unmarshal(msg, resp); err != nil {
@@ -2233,11 +2240,7 @@ func (as *mqttAccountSessionManager) handleRetainedMsg(key string, rf *mqttRetai
 			// Update the in-memory retained message cache but only for messages
 			// that are already in the cache, i.e. have been (recently) used.
 			if rm != nil {
-				if _, ok := as.rmsCache.Load(key); ok {
-					toStore := *rm
-					toStore.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL)
-					as.rmsCache.Store(key, toStore)
-				}
+				as.setCachedRetainedMsg(key, *rm, true)
 			}
 			return
 		}
@@ -2556,15 +2559,6 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		var jscons *ConsumerConfig
 		var jssub *subscription
 
-		serializeRMS := func(sub *subscription) error {
-			for _, ss := range append([]*subscription{sub}, sub.shadow...) {
-				if err := as.serializeRetainedMsgsForSub(rms, sess, c, ss, trace); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
 		// Note that if a subscription already exists on this subject, the
 		// existing sub is returned. Need to update the qos.
 		var sub *subscription
@@ -2640,9 +2634,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 	}
 
 	if fromSubProto {
-		// sess.Update may fail, but since at this point we have already
-		// subscribed - we should SUBACK normally.
-		sess.update(filters, true)
+		err = sess.update(filters, true)
 	}
 
 	return subs, err
@@ -2670,8 +2662,8 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 
 		rm := rms[string(psub.subject)]
 		if rm == nil {
-			// This should not happen since we pre-load messages into the cache
-			// before calling serialize.
+			// This should not happen since we pre-load messages into rms before
+			// calling serialize.
 			continue
 		}
 		var pi uint16
@@ -2747,28 +2739,35 @@ type warner interface {
 
 // Loads a list of retained messages given a list of stored message subjects.
 func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]struct{}, w warner) map[string]*mqttRetainedMsg {
+	rms := make(map[string]*mqttRetainedMsg)
 	ss := []string{}
 	for s := range subjects {
-		ss = append(ss, mqttRetainedMsgsStreamSubject+s)
+		if rm := as.getCachedRetainedMsg(s); rm != nil {
+			rms[s] = rm
+		} else {
+			ss = append(ss, mqttRetainedMsgsStreamSubject+s)
+		}
 	}
 
+	fmt.Printf("<>/<> loadLastMsgForMulti: %v\n", ss)
 	results, err := as.jsa.loadLastMsgForMulti(mqttRetainedMsgsStreamName, ss)
 	if err != nil {
 		return nil
 	}
 
-	rms := make(map[string]*mqttRetainedMsg)
 	for i, result := range results {
 		if result.ToError() != nil {
 			continue
 		}
-		rm, err := mqttDecodeRetainedMessage(result.Message.Header, result.Message.Data)
-		if err != nil {
+		var rm mqttRetainedMsg
+		if err := json.Unmarshal(result.Message.Data, &rm); err != nil {
 			w.Warnf("failed to decode retained message for subject %q: %v", ss[i], err)
 			continue
 		}
+		// Add the loaded retained message to the cache, and to the results map.
 		key := ss[i][len(mqttRetainedMsgsStreamSubject):]
-		rms[key] = rm
+		as.setCachedRetainedMsg(key, rm, false)
+		rms[key] = &rm
 	}
 	return rms
 }
@@ -2912,9 +2911,13 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 		smsg, err := jsa.loadNextMsgFor(mqttRetainedMsgsStreamName, "$MQTT.rmsgs")
 		if IsNatsErr(err, JSNoMessageFoundErr) {
 			// We've ran out of messages to transfer, done.
+			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 1\n")
+
 			break
 		}
 		if err != nil {
+			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 2\n")
+
 			log.Warnf("    Unable to transfer a retained message: failed to load from '$MQTT.rmsgs': %s", err)
 			return err
 		}
@@ -2927,8 +2930,10 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 			if _, err = jsa.storeMsg(subject, 0, smsg.Data); err != nil {
 				log.Errorf("    Unable to transfer the retained message with sequence %d: %v", smsg.Sequence, err)
 			}
+			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 3\n")
 			transferred++
 		} else {
+			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 4\n")
 			log.Warnf("    Unable to unmarshal retained message with sequence %d, skipping", smsg.Sequence)
 		}
 
@@ -2937,6 +2942,7 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 			log.Errorf("    Unable to clean up the retained message with sequence %d: %v", smsg.Sequence, err)
 			return err
 		}
+		fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 5\n")
 		processed++
 
 		now := time.Now()
@@ -2951,7 +2957,32 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 	} else {
 		log.Debugf("No messages found to transfer from '$MQTT.rmsgs'")
 	}
+	fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 100\n")
 	return nil
+}
+
+func (as *mqttAccountSessionManager) getCachedRetainedMsg(subject string) *mqttRetainedMsg {
+	v, ok := as.rmsCache.Load(subject)
+	if !ok {
+		return nil
+	}
+	rm := v.(mqttRetainedMsg)
+	if rm.expiresFromCache.Before(time.Now()) {
+		as.rmsCache.Delete(subject)
+		return nil
+	}
+	return &rm
+}
+
+func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm mqttRetainedMsg, onlyReplace bool) {
+	rm.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL)
+	if onlyReplace {
+		if _, ok := as.rmsCache.Load(subject); ok {
+			as.rmsCache.Store(subject, rm)
+		}
+	} else {
+		as.rmsCache.Store(subject, rm)
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////
