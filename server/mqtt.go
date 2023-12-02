@@ -1561,14 +1561,27 @@ func (jsa *mqttJSA) queueRequest(kind, subject, cidHash string, hdr int, msg []b
 }
 
 func (jsa *mqttJSA) newRequestEx(kind, subject, cidHash string, hdr int, msg []byte, timeout time.Duration) (any, error) {
-	all, err := jsa.newRequestExMulti(kind, subject, cidHash, []int{hdr}, [][]byte{msg}, timeout)
+	responses, err := jsa.newRequestExMulti(kind, subject, cidHash, []int{hdr}, [][]byte{msg}, timeout)
 	if err != nil {
 		return nil, err
 	}
-	return all[0], nil
+	if len(responses) != 1 {
+		return nil, fmt.Errorf("unreachable: invalid number of responses (%d)", len(responses))
+	}
+	type errorer interface {
+		ToError() error
+	}
+	r := responses[0]
+	if e, ok := r.value.(errorer); ok {
+		if err := e.ToError(); err != nil {
+			return nil, err
+		}
+	}
+	return r.value, nil
 }
 
-func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int, msgs [][]byte, timeout time.Duration) ([]any, error) {
+// newRequestExMulti sends multiple messages on the same subject and waits for all responses. UNless it times out, it returns the same number of responses in the same order as msgs parameter.
+func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int, msgs [][]byte, timeout time.Duration) ([]*mqttJSAResponse, error) {
 	if len(msgs) == 0 || len(hdrs) != len(msgs) {
 		return nil, fmt.Errorf("unreachable: invalid number of messages (%d) or header offsets (%d)", len(msgs), len(hdrs))
 	}
@@ -1580,17 +1593,16 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 	r2i := map[string]int{}
 	for i, msg := range msgs {
 		hdr := hdrs[i]
-		fmt.Printf("<>/<> 1 hdr: %v, msg: %s-----\n", hdr, msg)
 		reply := jsa.queueRequest(kind, subject, cidHash, hdr, msg, responseCh)
 		r2i[reply] = i
 	}
 
-	fmt.Printf("<>/<> 2 r2i: %v\n", r2i)
 	// Wait for all responses to come back, or for the timeout to expire. We
 	// don't want to use time.After() which causes memory growth because the
 	// timer can't be stopped and will need to expire to then be garbage
 	// collected.
-	responses := make([]any, len(msgs))
+	c := 0
+	responses := make([]*mqttJSAResponse, len(msgs))
 	start := time.Now()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
@@ -1598,11 +1610,9 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 		select {
 		case r := <-responseCh:
 			i := r2i[r.reply]
-			responses[i] = r.value
-			fmt.Printf("<>/<> 3 r: %v\n", r)
-			fmt.Printf("<>/<> 4 r.value: %v\n", r.value)
-			if len(responses) == len(msgs) {
-				fmt.Printf("<>/<> 5 responses: %v\n", responses)
+			responses[i] = r
+			c++
+			if c == len(msgs) {
 				return responses, nil
 			}
 
@@ -1619,7 +1629,7 @@ func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int,
 			if len(msgs) == 1 {
 				return nil, fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, subject, reply)
 			} else {
-				return nil, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, subject, len(responses), len(msgs))
+				return nil, fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, subject, c, len(msgs))
 			}
 		}
 	}
@@ -1743,7 +1753,7 @@ func (jsa *mqttJSA) loadLastMsgForMulti(streamName string, subjects []string) ([
 	// all has the same order as subjects, preserve it as we unmarshal
 	responses := []*JSApiMsgGetResponse{}
 	for _, v := range all {
-		responses = append(responses, v.(*JSApiMsgGetResponse))
+		responses = append(responses, v.value.(*JSApiMsgGetResponse))
 	}
 	return responses, nil
 }
@@ -1853,11 +1863,9 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	}
 	jsa.replies.Delete(subject)
 	ch := chi.(chan *mqttJSAResponse)
-	out := func(v any) {
-		fmt.Printf("<>/<> SENDING: %v\n", v)
-		ch <- &mqttJSAResponse{reply: subject, value: v}
+	out := func(value any) {
+		ch <- &mqttJSAResponse{reply: subject, value: value}
 	}
-		fmt.Printf("<>/<> TOKEN: %q\n", token)
 	switch token {
 	case mqttJSAStreamCreate:
 		var resp = &JSApiStreamCreateResponse{}
@@ -1903,13 +1911,11 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 		out(resp)
 	case mqttJSAMsgLoad:
 		fmt.Printf("<>/<> message load: %s\n", msg)
-		var resp = JSApiMsgGetResponse{}
+		var resp = &JSApiMsgGetResponse{}
 		if err := json.Unmarshal(msg, &resp); err != nil {
-			fmt.Printf("<>/<> message ERROR: %v\n", err)
 			resp.Error = NewJSInvalidJSONError()
 		}
-		fmt.Printf("<>/<> message out: %v\n", resp)
-		out(&resp)
+		out(resp)
 	case mqttJSAStreamNames:
 		var resp = &JSApiStreamNamesResponse{}
 		if err := json.Unmarshal(msg, resp); err != nil {
@@ -2507,6 +2513,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 					for _, ss := range sub.shadow {
 						as.addRetainedSubjectsForSubject(rmSubjects, string(ss.subject))
 					}
+					fmt.Printf("<>/<> added retained message subjects for %q: %v\n", subject, rmSubjects)
 				}
 				return nil
 			}
@@ -2525,7 +2532,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 	}
 
 	var rms map[string]*mqttRetainedMsg
-	if fromSubProto {
+	if fromSubProto && len(rmSubjects) > 0 {
 		// Make the best effort to load retained messages. We will identify
 		// errors in the next pass.
 		rms = as.loadRetainedMessages(rmSubjects, c)
@@ -2723,6 +2730,7 @@ func (as *mqttAccountSessionManager) addRetainedSubjectsForSubject(list map[stri
 	added := false
 	for _, sub := range result.psubs {
 		subject := string(sub.subject)
+		fmt.Printf("<>/<> .... %q\n", subject)
 		if _, ok := list[subject]; ok {
 			continue
 		}
@@ -2751,6 +2759,7 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]st
 
 	fmt.Printf("<>/<> loadLastMsgForMulti: %v\n", ss)
 	results, err := as.jsa.loadLastMsgForMulti(mqttRetainedMsgsStreamName, ss)
+	fmt.Printf("<>/<> loadLastMsgForMulti: %v %v\n", results, err)
 	if err != nil {
 		return nil
 	}

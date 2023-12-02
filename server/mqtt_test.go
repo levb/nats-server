@@ -3332,8 +3332,6 @@ func TestMQTTRetainedMsgMigration(t *testing.T) {
 	defer mc.Close()
 	testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
 
-	t.Log("<>/<> ==================================")
-
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "+", qos: 0}}, []byte{0})
 	topics := map[string]struct{}{}
 	for i := 0; i < N; i++ {
