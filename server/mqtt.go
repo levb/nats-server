@@ -1582,7 +1582,10 @@ func (jsa *mqttJSA) newRequestEx(kind, subject, cidHash string, hdr int, msg []b
 
 // newRequestExMulti sends multiple messages on the same subject and waits for all responses. UNless it times out, it returns the same number of responses in the same order as msgs parameter.
 func (jsa *mqttJSA) newRequestExMulti(kind, subject, cidHash string, hdrs []int, msgs [][]byte, timeout time.Duration) ([]*mqttJSAResponse, error) {
-	if len(msgs) == 0 || len(hdrs) != len(msgs) {
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	if len(hdrs) != len(msgs) {
 		return nil, fmt.Errorf("unreachable: invalid number of messages (%d) or header offsets (%d)", len(msgs), len(hdrs))
 	}
 	responseCh := make(chan *mqttJSAResponse, len(msgs))
@@ -1910,7 +1913,6 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 		}
 		out(resp)
 	case mqttJSAMsgLoad:
-		fmt.Printf("<>/<> message load: %s\n", msg)
 		var resp = &JSApiMsgGetResponse{}
 		if err := json.Unmarshal(msg, &resp); err != nil {
 			resp.Error = NewJSInvalidJSONError()
@@ -2513,7 +2515,6 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 					for _, ss := range sub.shadow {
 						as.addRetainedSubjectsForSubject(rmSubjects, string(ss.subject))
 					}
-					fmt.Printf("<>/<> added retained message subjects for %q: %v\n", subject, rmSubjects)
 				}
 				return nil
 			}
@@ -2730,7 +2731,6 @@ func (as *mqttAccountSessionManager) addRetainedSubjectsForSubject(list map[stri
 	added := false
 	for _, sub := range result.psubs {
 		subject := string(sub.subject)
-		fmt.Printf("<>/<> .... %q\n", subject)
 		if _, ok := list[subject]; ok {
 			continue
 		}
@@ -2757,9 +2757,11 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]st
 		}
 	}
 
-	fmt.Printf("<>/<> loadLastMsgForMulti: %v\n", ss)
+	if len(ss) == 0 {
+		return rms
+	}
+
 	results, err := as.jsa.loadLastMsgForMulti(mqttRetainedMsgsStreamName, ss)
-	fmt.Printf("<>/<> loadLastMsgForMulti: %v %v\n", results, err)
 	if err != nil {
 		return nil
 	}
@@ -2920,13 +2922,9 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 		smsg, err := jsa.loadNextMsgFor(mqttRetainedMsgsStreamName, "$MQTT.rmsgs")
 		if IsNatsErr(err, JSNoMessageFoundErr) {
 			// We've ran out of messages to transfer, done.
-			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 1\n")
-
 			break
 		}
 		if err != nil {
-			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 2\n")
-
 			log.Warnf("    Unable to transfer a retained message: failed to load from '$MQTT.rmsgs': %s", err)
 			return err
 		}
@@ -2939,10 +2937,8 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 			if _, err = jsa.storeMsg(subject, 0, smsg.Data); err != nil {
 				log.Errorf("    Unable to transfer the retained message with sequence %d: %v", smsg.Sequence, err)
 			}
-			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 3\n")
 			transferred++
 		} else {
-			fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 4\n")
 			log.Warnf("    Unable to unmarshal retained message with sequence %d, skipping", smsg.Sequence)
 		}
 
@@ -2951,7 +2947,6 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 			log.Errorf("    Unable to clean up the retained message with sequence %d: %v", smsg.Sequence, err)
 			return err
 		}
-		fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 5\n")
 		processed++
 
 		now := time.Now()
@@ -2966,7 +2961,6 @@ func (as *mqttAccountSessionManager) transferRetainedToPerKeySubjectStream(log *
 	} else {
 		log.Debugf("No messages found to transfer from '$MQTT.rmsgs'")
 	}
-	fmt.Printf("<>/<> +++++++++++++++++++++++++++++++++ 100\n")
 	return nil
 }
 
