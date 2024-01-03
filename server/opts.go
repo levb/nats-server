@@ -570,6 +570,10 @@ type MQTTOpts struct {
 	// downgradeQOS2Sub tells the MQTT client to downgrade QoS2 SUBSCRIBE
 	// requests to QoS1.
 	downgradeQoS2Sub bool
+
+	// DisableRetainedMessageCache disables the caching of retained images,
+	// used mostly for testing.
+	DisableRetainedMessageCache bool
 }
 
 type netResolver interface {

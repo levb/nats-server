@@ -242,7 +242,7 @@ type mqttAccountSessionManager struct {
 	flapTimer  *time.Timer                    // Timer to perform some cleanup of the flappers map
 	sl         *Sublist                       // sublist allowing to find retained messages for given subscription
 	retmsgs    map[string]*mqttRetainedMsgRef // retained messages
-	rmsCache   sync.Map                       // map[string(subject)]mqttRetainedMsg
+	rmsCache   *sync.Map                      // map[string(subject)]mqttRetainedMsg
 	jsa        mqttJSA
 	rrmLastSeq uint64        // Restore retained messages expected last sequence
 	rrmDoneCh  chan struct{} // To notify the caller that all retained messages have been loaded
@@ -1136,6 +1136,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			quitCh: quitCh,
 		},
 	}
+	if !opts.MQTT.DisableRetainedMessageCache {
+		as.rmsCache = &sync.Map{}
+	}
 	// TODO record domain name in as here
 
 	// The domain to communicate with may be required for JS calls.
@@ -1230,10 +1233,12 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	})
 
 	// Start the go routine that will clean up cached retained messages that expired.
-	s.startGoRoutine(func() {
-		defer s.grWG.Done()
-		as.cleaupRetainedMessageCache(s, closeCh)
-	})
+	if as.rmsCache != nil {
+		s.startGoRoutine(func() {
+			defer s.grWG.Done()
+			as.cleaupRetainedMessageCache(s, closeCh)
+		})
+	}
 
 	lookupStream := func(stream, txt string) (*StreamInfo, error) {
 		si, err := jsa.lookupStream(stream)
@@ -2150,7 +2155,7 @@ func (as *mqttAccountSessionManager) handleRetainedMsg(key string, rf *mqttRetai
 
 			// Update the in-memory retained message cache but only for messages
 			// that are already in the cache, i.e. have been (recently) used.
-			if rm != nil {
+			if rm != nil && as.rmsCache != nil {
 				if _, ok := as.rmsCache.Load(key); ok {
 					toStore := *rm
 					toStore.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL)
@@ -2180,7 +2185,9 @@ func (as *mqttAccountSessionManager) handleRetainedMsgDel(subject string, seq ui
 		as.sl = NewSublistWithCache()
 	}
 	if erm, ok := as.retmsgs[subject]; ok {
-		as.rmsCache.Delete(subject)
+		if as.rmsCache != nil {
+			as.rmsCache.Delete(subject)
+		}
 		if erm.sub != nil {
 			as.sl.Remove(erm.sub)
 			erm.sub = nil
@@ -2618,6 +2625,7 @@ func (as *mqttAccountSessionManager) loadRetainedMessagesForSubject(rms map[stri
 	if len(result.psubs) == 0 {
 		return
 	}
+
 	for _, sub := range result.psubs {
 		subject := string(sub.subject)
 		if rms[subject] != nil {
@@ -2625,10 +2633,12 @@ func (as *mqttAccountSessionManager) loadRetainedMessagesForSubject(rms map[stri
 		}
 
 		// See if we have the retained message in the cache.
-		if rmv, _ := as.rmsCache.Load(subject); rmv != nil {
-			rm := rmv.(mqttRetainedMsg)
-			rms[subject] = &rm
-			continue
+		if as.rmsCache != nil {
+			if rmv, _ := as.rmsCache.Load(subject); rmv != nil {
+				rm := rmv.(mqttRetainedMsg)
+				rms[subject] = &rm
+				continue
+			}
 		}
 
 		// Load the retained message from the stream, and cache it for reuse in
@@ -2647,7 +2657,9 @@ func (as *mqttAccountSessionManager) loadRetainedMessagesForSubject(rms map[stri
 
 		// Add the loaded retained message to the cache.
 		rm.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL)
-		as.rmsCache.Store(subject, rm)
+		if as.rmsCache != nil {
+			as.rmsCache.Store(subject, rm)
+		}
 		rms[subject] = &rm
 	}
 }

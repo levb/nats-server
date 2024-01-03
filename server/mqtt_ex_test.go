@@ -108,20 +108,33 @@ type MQTTBenchmarkResult struct {
 func BenchmarkMQTTEx(b *testing.B) {
 	bc := mqttNewBenchEx(b)
 	b.Run("Server", func(b *testing.B) {
-		b.Cleanup(bc.startServer(b))
-		bc.run(b)
+		b.Cleanup(bc.startServer(b, false))
+		bc.runAll(b)
 	})
 
 	b.Run("Cluster", func(b *testing.B) {
-		b.Cleanup(bc.startCluster(b))
-		bc.run(b)
+		b.Cleanup(bc.startCluster(b, false))
+		bc.runAll(b)
+	})
+
+	b.Run("Server-no-RMSCache", func(b *testing.B) {
+		b.Cleanup(bc.startServer(b, true))
+
+		bc.benchmarkSubRet(b)
+	})
+
+	b.Run("Cluster-no-RMSCache", func(b *testing.B) {
+		b.Cleanup(bc.startCluster(b, true))
+
+		bc.benchmarkSubRet(b)
 	})
 }
 
-func (bc mqttBenchContext) run(b *testing.B) {
+func (bc mqttBenchContext) runAll(b *testing.B) {
 	bc.benchmarkPub(b)
 	bc.benchmarkPubRetained(b)
 	bc.benchmarkPubSub(b)
+	bc.benchmarkSubRet(b)
 }
 
 // makes a copy of bc
@@ -185,6 +198,29 @@ func (bc mqttBenchContext) benchmarkPubSub(b *testing.B) {
 	})
 }
 
+// makes a copy of bc
+func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
+	// This test uses a a built-in publisher, and it makes most sense to measure
+	// the retained message delivery "overhead" on a QoS0 subscription; without
+	// the extra time involved in actually subscribing.
+	m := mqttBenchDefaultMatrix.
+		NoPublishers().
+		QOS0Only()
+
+	m.Topics = []int{1, 10, 100, 1 * 1000} // Test up to 1K retained messages.
+
+	b.Run("SUBRET", func(b *testing.B) {
+		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
+			bc.runCommand(b, "subret",
+				"--qos", strconv.Itoa(bc.QOS),
+				"--num-subscribers", strconv.Itoa(b.N),
+				"--num-topics", strconv.Itoa(bc.Topics),
+				"--size", strconv.Itoa(bc.MessageSize),
+			)
+		})
+	})
+}
+
 func mqttBenchLookupCommand(b *testing.B, name string) string {
 	b.Helper()
 	cmd, err := exec.LookPath(name)
@@ -235,11 +271,14 @@ func (bc mqttBenchContext) initServer(b *testing.B) {
 		"--num-subscribers", "1")
 }
 
-func (bc *mqttBenchContext) startServer(b *testing.B) func() {
+func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func() {
 	b.Helper()
 	b.StopTimer()
-	s := testMQTTRunServer(b, testMQTTDefaultOptions())
-	o := s.getOpts()
+	o := testMQTTDefaultOptions()
+	o.MQTT.DisableRetainedMessageCache = disableRMSCache
+	s := testMQTTRunServer(b, o)
+
+	o = s.getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
 	bc.initServer(b)
@@ -248,11 +287,37 @@ func (bc *mqttBenchContext) startServer(b *testing.B) func() {
 	}
 }
 
-func (bc *mqttBenchContext) startCluster(b *testing.B) func() {
+func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) func() {
 	b.Helper()
 	b.StopTimer()
-	cl := createJetStreamClusterWithTemplate(b,
-		testMQTTGetClusterTemplaceNoLeaf(), "MQTT", int(3))
+	v := "false"
+	if disableRMSCache {
+		v = "true"
+	}
+	confPt1 := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+
+		mqtt {
+			listen: 127.0.0.1:-1
+			stream_replicas: 3
+			disable_retained_message_cache: `
+	confPt2 := `
+		}
+
+		# For access to system account.
+		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+	`
+	conf := confPt1 + v + confPt2
+
+	cl := createJetStreamClusterWithTemplate(b, conf, "MQTT", 3)
 	o := cl.randomNonLeader().getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
