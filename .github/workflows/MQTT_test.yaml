@@ -25,7 +25,7 @@ jobs:
           wget https://github.com/hivemq/mqtt-cli/releases/download/v4.20.0/mqtt-cli-4.20.0.deb
           sudo apt install ./mqtt-cli-4.20.0.deb
           # <>/<> FIXME: use @latest
-          go install github.com/ConnectEverything/mqtt-test@36762e7b1c50335f56d9560dda218115e7b475c6
+          go install github.com/ConnectEverything/mqtt-test@7a66171
           go install golang.org/x/perf/cmd/benchstat@latest
 
       - name: Download benchmark result for ${{ github.base_ref || github.ref_name }}

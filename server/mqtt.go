@@ -1136,7 +1136,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			quitCh: quitCh,
 		},
 	}
-	if !opts.MQTT.DisableRetainedMessageCache {
+	if !opts.MQTT.disableRetainedMessageCache {
 		as.rmsCache = &sync.Map{}
 	}
 	// TODO record domain name in as here

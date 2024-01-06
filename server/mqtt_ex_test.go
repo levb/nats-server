@@ -94,15 +94,14 @@ var mqttBenchDefaultMatrix = mqttBenchMatrix{
 	MessageSize: []int{100, 1 * Kilo, 10 * Kilo},
 	// TODO: add N topics support, for now only 1.
 	Topics:      []int{1},
-	Publishers:  []int{1, 10},
+	Publishers:  []int{1, 5},
 	Subscribers: []int{1, 5},
 }
 
 type MQTTBenchmarkResult struct {
-	Ops   int           `json:"ops"`
-	NS    time.Duration `json:"ns"`
-	Unit  string        `json:"unit"`
-	Bytes int64         `json:"bytes"`
+	Ops   int                      `json:"ops"`
+	NS    map[string]time.Duration `json:"ns"`
+	Bytes int64                    `json:"bytes"`
 }
 
 func BenchmarkMQTTEx(b *testing.B) {
@@ -207,13 +206,14 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 		NoPublishers().
 		QOS0Only()
 
-	m.Topics = []int{1, 10, 100, 1 * 1000} // Test up to 1K retained messages.
+	m.Topics = []int{100}
 
 	b.Run("SUBRET", func(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
 			bc.runCommand(b, "subret",
 				"--qos", strconv.Itoa(bc.QOS),
-				"--num-subscribers", strconv.Itoa(b.N),
+				"--n", strconv.Itoa(b.N), // number of subscribe requests
+				"--num-subscribers", strconv.Itoa(bc.Subscribers),
 				"--num-topics", strconv.Itoa(bc.Topics),
 				"--size", strconv.Itoa(bc.MessageSize),
 			)
@@ -275,7 +275,7 @@ func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func
 	b.Helper()
 	b.StopTimer()
 	o := testMQTTDefaultOptions()
-	o.MQTT.DisableRetainedMessageCache = disableRMSCache
+	o.MQTT.disableRetainedMessageCache = disableRMSCache
 	s := testMQTTRunServer(b, o)
 
 	o = s.getOpts()
@@ -405,10 +405,12 @@ func sizeKB(size int) string {
 }
 
 func (r MQTTBenchmarkResult) report(b *testing.B) {
-	nsOp := float64(r.NS) / float64(r.Ops)
 	b.ReportMetric(0, "ns/op")
-	b.ReportMetric(nsOp/1000000, r.Unit+"_ms/op")
 	b.SetBytes(r.Bytes)
+	for unit, ns := range r.NS {
+		nsOp := float64(ns) / float64(r.Ops)
+		b.ReportMetric(nsOp/1000000, unit+"_ms/op")
+	}
 	b.ReportAllocs()
 }
 

@@ -571,9 +571,9 @@ type MQTTOpts struct {
 	// requests to QoS1.
 	downgradeQoS2Sub bool
 
-	// DisableRetainedMessageCache disables the caching of retained images,
-	// used mostly for testing.
-	DisableRetainedMessageCache bool
+	// disableRetainedMessageCache disables the caching of retained images,
+	// used only for testing.
+	disableRetainedMessageCache bool
 }
 
 type netResolver interface {
@@ -4690,6 +4690,8 @@ func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) er
 			o.MQTT.rejectQoS2Pub = mv.(bool)
 		case "downgrade_qos2_subscribe":
 			o.MQTT.downgradeQoS2Sub = mv.(bool)
+		case "disable_retained_message_cache":
+			o.MQTT.disableRetainedMessageCache = mv.(bool)
 
 		default:
 			if !tk.IsUsedVariable() {
