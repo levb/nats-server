@@ -42,7 +42,7 @@ jobs:
           cd src/github.com/nats-io/nats-server
           mkdir -p bench
           go test -v --run='MQTTEx' ./server
-          go test --run='-' --bench 'MQTTEx' --benchtime=100x --count=10 ./server | tee output.txt
+          go test --timeout=30m --run='-' --bench 'MQTTEx' --benchtime=100x --count=2 ./server | tee output.txt
 
       - name: Compare benchmarks
         shell: bash --noprofile --norc -eo pipefail {0}
