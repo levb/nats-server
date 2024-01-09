@@ -1,15 +1,11 @@
-name: MQTT Compliance 
+name: MQTTEx
 on: [push, pull_request]
 
 jobs:
   test:
-    strategy:
-      matrix:
-        go: ["1.21"]
     env:
       GOPATH: /home/runner/work/nats-server
       GO111MODULE: "on"
-
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -20,18 +16,48 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{matrix.go}}
+          go-version: 1.21
 
-      - name: Install deps
-        shell: bash --noprofile --norc -x -eo pipefail {0}
+      - name: Set up testing tools and environment
+        shell: bash --noprofile --norc -eo pipefail {0}
+        id: setup
         run: |
           wget https://github.com/hivemq/mqtt-cli/releases/download/v4.20.0/mqtt-cli-4.20.0.deb
           sudo apt install ./mqtt-cli-4.20.0.deb
+          # <>/<> FIXME: use @latest
+          go install github.com/ConnectEverything/mqtt-test@7a66171
+          go install golang.org/x/perf/cmd/benchstat@latest
 
-      - name: Run tests
-        shell: bash --noprofile --norc -x -eo pipefail {0}
+      - name: Download benchmark result for ${{ github.base_ref || github.ref_name }}
+        uses: dawidd6/action-download-artifact@v2
+        continue-on-error: true
+        with:
+          path: src/github.com/nats-io/nats-server/bench
+          name: bench-output-${{ runner.os }}
+          branch: ${{ github.base_ref || github.ref }}
+
+      - name: Run tests and benchmarks
+        shell: bash --noprofile --norc -eo pipefail {0}
         run: |
-          set -e
-          cd src/github.com/nats-io/nats-server/server
-          go test -v -vet=off --run=TestMQTTCLICompliance
-          set +e
+          cd src/github.com/nats-io/nats-server
+          mkdir -p bench
+          go test -v --run='MQTTEx' ./server
+          go test --timeout=20m --run='-' --bench 'MQTTEx' --benchtime=100x --count=10 ./server | tee output.txt
+
+      # - name: Compare benchmarks
+      #   shell: bash --noprofile --norc -eo pipefail {0}
+      #   run: |
+      #     cd src/github.com/nats-io/nats-server
+      #     if [ -f bench/output.txt ]; then
+      #       benchstat bench/output.txt output.txt | tee bench/compare.txt
+      #     else
+      #       echo "No previous benchmark result from for ${{ github.base_ref || github.ref}} to compare with"
+      #     fi
+      #     mv output.txt bench/output.txt
+
+      - name: Store benchmark result for ${{ github.ref_name }}
+        uses: actions/upload-artifact@v3
+        with:
+          path: src/github.com/nats-io/nats-server/bench
+          name: bench-output-${{ runner.os }}
+
