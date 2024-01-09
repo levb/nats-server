@@ -63,8 +63,7 @@ func TestMQTTExCompliance(t *testing.T) {
 }
 
 const (
-	Kilo = 1024
-	Mega = 1024 * Kilo
+	KB = 1024
 )
 
 type mqttBenchMatrix struct {
@@ -91,11 +90,10 @@ type mqttBenchContext struct {
 
 var mqttBenchDefaultMatrix = mqttBenchMatrix{
 	QOS:         []int{0, 1, 2},
-	MessageSize: []int{100, 1 * Kilo, 10 * Kilo},
-	// TODO: add N topics support, for now only 1.
-	Topics:      []int{1},
+	MessageSize: []int{100, 1 * KB, 10 * KB},
+	Topics:      []int{100},
 	Publishers:  []int{1, 5},
-	Subscribers: []int{1, 5},
+	Subscribers: []int{1, 3},
 }
 
 type MQTTBenchmarkResult struct {
@@ -205,8 +203,6 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 	m := mqttBenchDefaultMatrix.
 		NoPublishers().
 		QOS0Only()
-
-	m.Topics = []int{100}
 
 	b.Run("SUBRET", func(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
@@ -394,12 +390,9 @@ func (m mqttBenchMatrix) QOS1Only() mqttBenchMatrix {
 func sizeKB(size int) string {
 	unit := "B"
 	N := size
-	if size >= Mega {
-		unit = "MB"
-		N /= Mega
-	} else if size >= Kilo {
+	if size >= KB {
 		unit = "KB"
-		N /= Kilo
+		N = (N + KB/2) / KB
 	}
 	return fmt.Sprintf("%d%s", N, unit)
 }
