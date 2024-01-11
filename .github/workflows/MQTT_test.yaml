@@ -48,6 +48,8 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           cd src/github.com/nats-io/nats-server
+          ls -lsa bench
+          echo "======================================================================="
           if [ -f bench/output.txt ]; then
             benchstat bench/output.txt output.txt | tee bench/compare.txt
           else
