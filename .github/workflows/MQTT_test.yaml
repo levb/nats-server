@@ -42,14 +42,12 @@ jobs:
           cd src/github.com/nats-io/nats-server
           mkdir -p bench
           go test -v --run='MQTTEx' ./server
-          go test --timeout=20m --run='-' --bench 'MQTTEx//SUBRET' --benchtime=100x --count=3 ./server | tee output.txt
+          go test --timeout=20m --run='-' --bench 'MQTTEx/-no-/SUBRET' --benchtime=100x --count=10 ./server | tee output.txt
 
       - name: Compare benchmarks
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           cd src/github.com/nats-io/nats-server
-          ls -lsa bench
-          echo "======================================================================="
           if [ -f bench/output.txt ]; then
             benchstat bench/output.txt output.txt | tee bench/compare.txt
           else
