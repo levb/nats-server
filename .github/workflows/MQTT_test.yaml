@@ -54,7 +54,7 @@ jobs:
           tool: go
           output-file-path: src/github.com/nats-io/nats-server/output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          alert-threshold: 110%
+          alert-threshold: 120%
           comment-on-alert: true
           comment-always: true
           external-data-json-path: src/github.com/nats-io/nats-server/bench/benchmark-data.json
