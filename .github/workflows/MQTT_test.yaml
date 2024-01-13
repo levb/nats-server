@@ -40,21 +40,29 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           cd src/github.com/nats-io/nats-server
-          mkdir -p bench
+          # ls -lsa bench # <>/<>
           go test -v --run='MQTTEx' ./server
           go test --timeout=20m --run='-' --bench 'MQTTEx/-no-/SUBRET' --benchtime=100x --count=10 ./server | tee output.txt
 
       - name: Compare benchmarks
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: go
+          output-file-path: src/github.com/nats-io/nats-server/output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+          comment-always: true
+          alert-threshold: 110%
+          comment-on-alert: true
+          fail-on-alert: true
+          external-data-json-path: src/github.com/nats-io/nats-server/bench/benchmark-data.json
+
+
+      - name: check!!!
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           cd src/github.com/nats-io/nats-server
-          if [ -f bench/output.txt ]; then
-            benchstat bench/output.txt output.txt | tee bench/compare.txt
-          else
-            echo "No previous benchmark result from for ${{ github.base_ref || github.ref}} to compare with"
-          fi
-          ls -lsa output.txt
-          mv output.txt bench/output.txt
+          ls -lsa bench # <>/<>
 
       - name: Store benchmark result for ${{ github.ref_name }}
         uses: actions/upload-artifact@v3
