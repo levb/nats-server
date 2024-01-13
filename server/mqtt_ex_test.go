@@ -402,7 +402,7 @@ func (r MQTTBenchmarkResult) report(b *testing.B) {
 	b.SetBytes(r.Bytes)
 	for unit, ns := range r.NS {
 		nsOp := float64(ns) / float64(r.Ops)
-		b.ReportMetric(nsOp/1000000 * 2, unit+"_ms/op")
+		b.ReportMetric(nsOp/1000000, unit+"_ms/op")
 	}
 	b.ReportAllocs()
 }
