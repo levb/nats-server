@@ -57,9 +57,11 @@ jobs:
           alert-threshold: 120%
           comment-on-alert: true
           comment-always: true
+          fail-on-alert: true
           external-data-json-path: src/github.com/nats-io/nats-server/bench/benchmark-data.json
 
       - name: Store benchmark result for ${{ github.ref_name }}
+        if: always()
         uses: actions/upload-artifact@v3
         with:
           path: src/github.com/nats-io/nats-server/bench
