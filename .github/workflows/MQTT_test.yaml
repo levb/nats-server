@@ -40,7 +40,7 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           cd src/github.com/nats-io/nats-server
-          ls -lsa bench # <>/<>
+          # ls -lsa bench # <>/<>
           go test -v --run='MQTTEx' ./server
           go test --timeout=20m --run='-' --bench 'MQTTEx/-no-/SUBRET' --benchtime=100x --count=10 ./server | tee output.txt
 
