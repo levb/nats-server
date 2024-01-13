@@ -56,6 +56,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           alert-threshold: 110%
           comment-on-alert: true
+          comment-always: true
           external-data-json-path: src/github.com/nats-io/nats-server/bench/benchmark-data.json
 
       - name: Store benchmark result for ${{ github.ref_name }}
