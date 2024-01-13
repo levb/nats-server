@@ -53,7 +53,7 @@ jobs:
           tool: go
           output-file-path: src/github.com/nats-io/nats-server/output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ github.ref }}
+          # ref: ${{ github.ref }}
           alert-threshold: 110%
           comment-on-alert: true
           fail-on-alert: true
