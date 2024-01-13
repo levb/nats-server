@@ -2,8 +2,8 @@ name: MQTTEx
 on: [push, pull_request]
 
 permissions:
-  # deployments: write
-  # contents: write
+  deployments: write
+  contents: write
   pull-requests: write
 
 jobs:
@@ -47,7 +47,7 @@ jobs:
           cd src/github.com/nats-io/nats-server
           # ls -lsa bench # <>/<>
           go test -v --run='MQTTEx' ./server
-          go test --timeout=20m --run='-' --bench 'MQTTEx/-no-/SUBRET' --benchtime=100x --count=10 ./server | tee output.txt
+          go test --timeout=20m --run='-' --bench 'MQTTEx/Server-no-/SUBRET' --benchtime=100x --count=10 ./server | tee output.txt
 
       - name: Compare benchmarks
         uses: benchmark-action/github-action-benchmark@v1
@@ -61,13 +61,6 @@ jobs:
           comment-on-alert: true
           fail-on-alert: true
           external-data-json-path: src/github.com/nats-io/nats-server/bench/benchmark-data.json
-
-
-      - name: check!!!
-        shell: bash --noprofile --norc -eo pipefail {0}
-        run: |
-          cd src/github.com/nats-io/nats-server
-          ls -lsa bench # <>/<>
 
       - name: Store benchmark result for ${{ github.ref_name }}
         uses: actions/upload-artifact@v3
