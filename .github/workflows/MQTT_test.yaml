@@ -45,7 +45,7 @@ jobs:
         run: |
           cd src/github.com/nats-io/nats-server
           go test -v --run='MQTTEx' ./server
-          go test --run='-' --count=10 --bench 'MQTT_' ./server | tee output.txt
+          # go test --run='-' --count=10 --bench 'MQTT_' ./server | tee output.txt
           go test --run='-' --count=10 --bench 'MQTTEx' --timeout=20m --benchtime=100x ./server | tee -a output.txt
 
       - name: Compare benchmarks
