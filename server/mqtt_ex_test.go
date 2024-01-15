@@ -398,8 +398,14 @@ func sizeKB(size int) string {
 }
 
 func (r MQTTBenchmarkResult) report(b *testing.B) {
+	// Disable the default ns metric in favor of custom X_ms/op.
 	b.ReportMetric(0, "ns/op")
-	b.SetBytes(r.Bytes)
+
+	// Disable MB/s since the github benchmarking action misinterprets the
+	// result.
+	b.SetBytes(0)
+	// b.SetBytes(r.Bytes)
+
 	for unit, ns := range r.NS {
 		nsOp := float64(ns) / float64(r.Ops)
 		b.ReportMetric(nsOp/1000000, unit+"_ms/op")
