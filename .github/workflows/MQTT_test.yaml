@@ -46,6 +46,7 @@ jobs:
           cd src/github.com/nats-io/nats-server
           # go test -v --run='MQTTEx' ./server
           # go test --run='-' --count=10 --bench 'MQTT_' ./server | tee output.txt
+          # go test --run='-' --count=10 --bench 'MQTTEx' --timeout=20m --benchtime=100x ./server | tee -a output.txt
           go test --run='-' --count=10 --bench 'MQTTEx/Server-no/SUBRET/' --timeout=20m --benchtime=100x ./server | tee -a output.txt
 
       - name: Compare benchmarks
@@ -56,7 +57,6 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           alert-threshold: 120%
           comment-on-alert: true
-          comment-always: true
           fail-on-alert: true
           external-data-json-path: src/github.com/nats-io/nats-server/bench/benchmark-data.json
 
