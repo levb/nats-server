@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -27,14 +28,66 @@ import (
 	"time"
 )
 
-func TestMQTTExCompliance(t *testing.T) {
-	mqttPath := os.Getenv("MQTT_CLI")
-	if mqttPath == "" {
-		if p, err := exec.LookPath("mqtt"); err == nil {
-			mqttPath = p
-		}
+var mqttCLICommandPath = func() string {
+	p := os.Getenv("MQTT_CLI")
+	if p == "" {
+		p, _ = exec.LookPath("mqtt")
 	}
-	if mqttPath == "" {
+	return p
+}()
+
+var mqttTestCommandPath = func() string {
+	p, _ := exec.LookPath("mqtt-test")
+	return p
+}()
+
+func mqttRunTestCommand(tb testing.TB, subCommand string, dial []string, extraArgs ...string) *MQTTBenchmarkResult {
+	tb.Helper()
+
+	args := []string{subCommand /*, "-q" */}
+	for _, s := range dial {
+		args = append(args, "-s", s)
+	}
+	args = append(args, extraArgs...)
+
+	cmd := exec.Command(mqttTestCommandPath, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		tb.Fatalf("Error executing %q: %v", cmd.String(), err)
+	}
+	defer stdout.Close()
+	errbuf := bytes.Buffer{}
+	cmd.Stderr = &errbuf
+	if err = cmd.Start(); err != nil {
+		tb.Fatalf("Error executing %q: %v", cmd.String(), err)
+	}
+	out, err := io.ReadAll(stdout)
+	if err != nil {
+		tb.Fatalf("Error executing %q: failed to read output: %v", cmd.String(), err)
+	}
+	if err = cmd.Wait(); err != nil {
+		tb.Fatalf("Error executing %q: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
+	}
+
+	r := &MQTTBenchmarkResult{}
+	if err := json.Unmarshal(out, r); err != nil {
+		tb.Fatalf("Error executing %q: failed to decode output: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
+	}
+	return r
+}
+
+func mqttInitServer(tb testing.TB, dialAddr string) {
+	tb.Helper()
+	mqttRunTestCommand(tb, "pubsub", []string{dialAddr},
+		"--id", "__init__",
+		"--qos", "0",
+		"--n", "1",
+		"--size", "100",
+		"--num-subscribers", "1")
+}
+
+func TestMQTTExCompliance(t *testing.T) {
+	if mqttCLICommandPath == "" {
 		t.Skip(`"mqtt" command is not found in $PATH nor $MQTT_CLI. See https://hivemq.github.io/mqtt-cli/docs/installation/#debian-package for installation instructions`)
 	}
 
@@ -51,7 +104,7 @@ func TestMQTTExCompliance(t *testing.T) {
 	s, o := RunServerWithConfig(conf)
 	defer testMQTTShutdownServer(s)
 
-	cmd := exec.Command(mqttPath, "test", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
+	cmd := exec.Command(mqttCLICommandPath, "test", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
 
 	output, err := cmd.CombinedOutput()
 	t.Log(string(output))
@@ -83,9 +136,6 @@ type mqttBenchContext struct {
 
 	Host string
 	Port int
-
-	// full path to mqtt-test command
-	testCmdPath string
 }
 
 var mqttBenchDefaultMatrix = mqttBenchMatrix{
@@ -103,7 +153,11 @@ type MQTTBenchmarkResult struct {
 }
 
 func BenchmarkMQTTEx(b *testing.B) {
-	bc := mqttNewBenchEx(b)
+	if mqttTestCommandPath == "" {
+		b.Skip(`"mqtt-test" command is not found in $PATH.`)
+	}
+
+	bc := mqttBenchContext{}
 	b.Run("Server", func(b *testing.B) {
 		b.Cleanup(bc.startServer(b, false))
 		bc.runAll(b)
@@ -217,54 +271,10 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 	})
 }
 
-func mqttBenchLookupCommand(b *testing.B, name string) string {
-	b.Helper()
-	cmd, err := exec.LookPath(name)
-	if err != nil {
-		b.Skipf("%q command is not found in $PATH. Please `go install github.com/nats-io/meta-nats/apps/go/mqtt/...@latest` and try again.", name)
-	}
-	return cmd
-}
-
 func (bc mqttBenchContext) runCommand(b *testing.B, name string, extraArgs ...string) {
 	b.Helper()
-
-	args := append([]string{
-		name,
-		"-q",
-		"--servers", fmt.Sprintf("%s:%d", bc.Host, bc.Port),
-	}, extraArgs...)
-
-	cmd := exec.Command(bc.testCmdPath, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		b.Fatalf("Error executing %q: %v", cmd.String(), err)
-	}
-	defer stdout.Close()
-	errbuf := bytes.Buffer{}
-	cmd.Stderr = &errbuf
-	if err = cmd.Start(); err != nil {
-		b.Fatalf("Error executing %q: %v", cmd.String(), err)
-	}
-	r := &MQTTBenchmarkResult{}
-	if err = json.NewDecoder(stdout).Decode(r); err != nil {
-		b.Fatalf("failed to decode output of %q: %v\n\n%s", cmd.String(), err, errbuf.String())
-	}
-	if err = cmd.Wait(); err != nil {
-		b.Fatalf("Error executing %q: %v\n\n%s", cmd.String(), err, errbuf.String())
-	}
-
+	r := mqttRunTestCommand(b, name, []string{fmt.Sprintf("%s:%d", bc.Host, bc.Port)}, extraArgs...)
 	r.report(b)
-}
-
-func (bc mqttBenchContext) initServer(b *testing.B) {
-	b.Helper()
-	bc.runCommand(b, "pubsub",
-		"--id", "__init__",
-		"--qos", "0",
-		"--n", "1",
-		"--size", "100",
-		"--num-subscribers", "1")
 }
 
 func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func() {
@@ -278,7 +288,7 @@ func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func
 	o = s.getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
-	bc.initServer(b)
+	mqttInitServer(b, fmt.Sprintf("mqtt://%s:%d", bc.Host, bc.Port))
 	return func() {
 		testMQTTShutdownServer(s)
 		testDisableRMSCache = prevDisableRMSCache
@@ -314,7 +324,7 @@ func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) fun
 	o := cl.randomNonLeader().getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
-	bc.initServer(b)
+	mqttInitServer(b, fmt.Sprintf("mqtt://%s:%d", bc.Host, bc.Port))
 	return func() {
 		cl.shutdown()
 		testDisableRMSCache = prevDisableRMSCache
@@ -413,11 +423,4 @@ func (r MQTTBenchmarkResult) report(b *testing.B) {
 	// Diable ReportAllocs() since it confuses the github benchmarking action
 	// with the noise.
 	// b.ReportAllocs()
-}
-
-func mqttNewBenchEx(b *testing.B) *mqttBenchContext {
-	cmd := mqttBenchLookupCommand(b, "mqtt-test")
-	return &mqttBenchContext{
-		testCmdPath: cmd,
-	}
 }
