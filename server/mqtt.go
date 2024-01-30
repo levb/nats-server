@@ -1222,6 +1222,15 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, err
 	}
 
+	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
+	// that a user would allow permissions on.
+	rmsubj := mqttSubPrefix + nuid.Next()
+	rmsubjSubscribe := rmsubj + ".>"
+	rmsubjPublish := rmsubj // + "." + s.String()
+	if err := as.createSubscription(rmsubjSubscribe, as.processRetainedMsg, &sid, &subs); err != nil {
+		return nil, err
+	}
+
 	// Create a subscription to be notified of retained messages delete requests.
 	rmdelsubj := mqttJSARepliesPrefix + "*." + mqttJSARetainedMsgDel
 	if err := as.createSubscription(rmdelsubj, as.processRetainedMsgDel, &sid, &subs); err != nil {
