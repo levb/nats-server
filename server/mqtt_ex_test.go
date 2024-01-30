@@ -86,35 +86,6 @@ func mqttInitServer(tb testing.TB, dialAddr string) {
 		"--num-subscribers", "1")
 }
 
-func TestMQTTExCompliance(t *testing.T) {
-	if mqttCLICommandPath == "" {
-		t.Skip(`"mqtt" command is not found in $PATH nor $MQTT_CLI. See https://hivemq.github.io/mqtt-cli/docs/installation/#debian-package for installation instructions`)
-	}
-
-	conf := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: 127.0.0.1:-1
-		server_name: mqtt
-		jetstream {
-			store_dir = %q
-		}
-		mqtt {
-			listen: 127.0.0.1:-1
-		}
-	`, t.TempDir())))
-	s, o := RunServerWithConfig(conf)
-	defer testMQTTShutdownServer(s)
-
-	cmd := exec.Command(mqttCLICommandPath, "test", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
-
-	output, err := cmd.CombinedOutput()
-	t.Log(string(output))
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			t.Fatalf("mqtt cli exited with error: %v", exitError)
-		}
-	}
-}
-
 const (
 	KB = 1024
 )

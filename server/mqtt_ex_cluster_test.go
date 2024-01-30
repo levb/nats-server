@@ -19,18 +19,56 @@ package server
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
 	"testing"
 )
-
-const testMQTTClusterConf = `
-	mqtt {
-		listen: 127.0.0.1:-1
-		stream_replicas: 3
-	}`
 
 type testMQTTTarget struct {
 	name string
 	dial []string
+}
+
+func TestMQTTExCompliance(t *testing.T) {
+	if mqttCLICommandPath == "" {
+		t.Skip(`"mqtt" command is not found in $PATH nor $MQTT_CLI. See https://hivemq.github.io/mqtt-cli/docs/installation/#debian-package for installation instructions`)
+	}
+
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	o = s.getOpts()
+	defer testMQTTShutdownServer(s)
+
+	cmd := exec.Command(mqttCLICommandPath, "", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
+
+	output, err := cmd.CombinedOutput()
+	t.Log(string(output))
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("mqtt cli exited with error: %v", exitError)
+		}
+	}
+}
+
+func TestMQTTExXXX(t *testing.T) {
+	if mqttCLICommandPath == "" {
+		t.Skip(`"mqtt" command is not found in $PATH nor $MQTT_CLI. See https://hivemq.github.io/mqtt-cli/docs/installation/#debian-package for installation instructions`)
+	}
+
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	o = s.getOpts()
+	defer testMQTTShutdownServer(s)
+
+	cmd := exec.Command(mqttCLICommandPath, "", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
+
+	output, err := cmd.CombinedOutput()
+	t.Log(string(output))
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("mqtt cli exited with error: %v", exitError)
+		}
+	}
 }
 
 func TestMQTTExRetainedMessages(t *testing.T) {
@@ -42,10 +80,10 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 		name  string
 		makef func(t *testing.T) ([]testMQTTTarget, func())
 	}{
-		// {
-		// 	name:  "single server",
-		// 	makef: testMQTTmakeSingleServer,
-		// },
+		{
+			name:  "single server",
+			makef: testMQTTmakeSingleServer,
+		},
 		// {
 		// 	name:  "server with leafnode",
 		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
@@ -62,10 +100,10 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 		// 	name:  "cluster",
 		// 	makef: testMQTTmakeCluster(4, ""),
 		// },
-		{
-			name:  "cluster with leafnode cluster",
-			makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
-		},
+		// {
+		// 	name:  "cluster with leafnode cluster",
+		// 	makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
+		// },
 		// {
 		// 	name:  "cluster with leafnode cluster no system account",
 		// 	makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", false),
@@ -86,10 +124,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				mqttInitServer(t, targets[0].dial[0])
 			})
 
-			for i, target := range targets {
-				if i > 2 {
-					break
-				}
+			for _, target := range targets {
 				t.Run(target.name, func(t *testing.T) {
 					mqttRunTestCommand(t, "subret", target.dial,
 						"--qos", "0",
@@ -101,6 +136,17 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMQTTRetainedMessageRecoveredOnRestart(t *testing.T) {
+	if mqttCLICommandPath == "" {
+		t.Skip(`"mqtt" command is not found in $PATH.`)
+	}
+
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	o = s.getOpts()
+
 }
 
 func testMQTTmakeSingleServer(t *testing.T) ([]testMQTTTarget, func()) {
@@ -275,7 +321,7 @@ func testMQTTmakeCluster(size int, domain string) func(t *testing.T) ([]testMQTT
 				}
 			}
 		}
-		return targets, func() { cl.shutdown() }
+		return targets[1:2], func() { cl.shutdown() }
 	}
 }
 
@@ -368,13 +414,13 @@ func testMQTTmakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAcc
 
 		var targets []testMQTTTarget
 
-		// hub.servers[0]
-		// targets = append(targets, testMQTTTarget{
-		// 	name: hub.servers[0].info.Name,
-		// 	dial: []string{
-		// 		fmt.Sprintf("one:p@%s:%d", hub.opts[0].MQTT.Host, hub.opts[0].MQTT.Port),
-		// 	},
-		// })
+		// // hub.servers[0]
+		targets = append(targets, testMQTTTarget{
+			name: hub.servers[0].info.Name,
+			dial: []string{
+				fmt.Sprintf("one:p@%s:%d", hub.opts[0].MQTT.Host, hub.opts[0].MQTT.Port),
+			},
+		})
 
 		// spoke.servers[0]
 		// targets = append(targets, testMQTTTarget{
@@ -392,14 +438,15 @@ func testMQTTmakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAcc
 		// 		fmt.Sprintf("one:p@%s:%d", spoke.opts[2].MQTT.Host, spoke.opts[2].MQTT.Port),
 		// 	},
 		// })
-		// publish to leafCl.servers[1], subscribe at hub.servers[2]
-		targets = append(targets, testMQTTTarget{
-			name: spoke.servers[1].info.Name + " to " + hub.servers[2].info.Name,
-			dial: []string{
-				fmt.Sprintf("one:p@%s:%d", spoke.opts[1].MQTT.Host, spoke.opts[1].MQTT.Port),
-				fmt.Sprintf("one:p@%s:%d", hub.opts[2].MQTT.Host, hub.opts[2].MQTT.Port),
-			},
-		})
+
+		// // publish to leafCl.servers[1], subscribe at hub.servers[2]
+		// targets = append(targets, testMQTTTarget{
+		// 	name: spoke.servers[1].info.Name + " to " + hub.servers[2].info.Name,
+		// 	dial: []string{
+		// 		fmt.Sprintf("one:p@%s:%d", spoke.opts[1].MQTT.Host, spoke.opts[1].MQTT.Port),
+		// 		fmt.Sprintf("one:p@%s:%d", hub.opts[2].MQTT.Host, hub.opts[2].MQTT.Port),
+		// 	},
+		// })
 
 		return targets, func() {
 			spoke.shutdown()

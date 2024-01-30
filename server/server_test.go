@@ -82,9 +82,12 @@ func RunServer(opts *Options) *Server {
 		panic(fmt.Sprintf("No NATS Server object returned: %v", err))
 	}
 
-	if !opts.NoLog {
-		s.ConfigureLogger()
-	}
+	// if !opts.NoLog { <>/<>
+	opts.NoLog = false
+	opts.Trace = false
+	opts.Debug = false
+	s.ConfigureLogger()
+	// }
 
 	// Run server in Go routine.
 	s.Start()

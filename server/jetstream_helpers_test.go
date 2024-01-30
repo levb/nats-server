@@ -788,6 +788,7 @@ func createJetStreamClusterEx(t testing.TB, tmpl, cName, snPre string, numServer
 		storeDir := t.TempDir()
 		sn := fmt.Sprintf("%sS-%d", snPre, cp-portStart+1)
 		conf := fmt.Sprintf(tmpl, sn, storeDir, cName, cp, routeConfig)
+		// t.Log("<>/<> Config:\n---\n", conf)
 		if modify != nil {
 			conf = modify(sn, cName, storeDir, conf)
 		}

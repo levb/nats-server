@@ -1076,6 +1076,7 @@ func mqttParsePubRelNATSHeader(headerBytes []byte) uint16 {
 // If new, creates the required JetStream streams/consumers
 // for handling of sessions and messages.
 func (s *Server) getOrCreateMQTTAccountSessionManager(clientID string, c *client) (*mqttAccountSessionManager, error) {
+	fmt.Printf("<>/<> %s: getOrCreateMQTTAccountSessionManager: %q\n", s, clientID)
 	sm := &s.mqtt.sessmgr
 
 	c.mu.Lock()
@@ -1175,9 +1176,11 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.domainTk = d + "."
 	}
 	if as.jsa.domainSet {
+		fmt.Printf("<>/<> %s: Ensuring MQTT streams/consumers with replicas %v for account %q in domain %q\n", s, replicas, accName, as.jsa.domain)
 		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q in domain %q", replicas, accName, as.jsa.domain)
 	} else {
-		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q", replicas, accName)
+		fmt.Printf("<>/<> %s: Ensuring MQTT streams/consumers with replicas %v for account %q\n", s, replicas, accName)
+		s.Noticef("Ensuring MQTT streams/consumers with replicas %v for account %q", replicas, accName)
 	}
 
 	var subs []*subscription
@@ -1216,13 +1219,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	//   `$MQTT.JSA.{js-id}.SP.{client-id-hash}.{uuid}`
 	if err := as.createSubscription(mqttJSARepliesPrefix+"*."+mqttJSASessPersist+".*.*",
 		as.processSessionPersist, &sid, &subs); err != nil {
-		return nil, err
-	}
-
-	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
-	// that a user would allow permissions on.
-	rmsubj := mqttSubPrefix + nuid.Next()
-	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
 		return nil, err
 	}
 
@@ -1267,6 +1263,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			s.Warnf("MQTT %s stream replicas mismatch: current is %v but configuration is %v for '%s > %s'",
 				txt, sr, replicas, accName, stream)
 		}
+		fmt.Printf("<>/<> %s: found %+v\n", s, si)
 		return si, nil
 	}
 
@@ -1473,9 +1470,11 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			InactiveThreshold: 5 * time.Minute,
 		},
 	}
+	start := time.Now()
 	if _, err := jsa.createConsumer(ccfg); err != nil {
 		return nil, fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 	}
+	fmt.Printf("<>/<> %s: !!! created retained messages consumer %q filter:%q, pub %q->%q in %v\n", s, rmDurName, ccfg.Config.FilterSubject, rmsubjPublish, rmsubjSubscribe, time.Since(start))
 
 	if lastSeq > 0 {
 		ttl := time.NewTimer(mqttJSAPITimeout)
@@ -1943,6 +1942,8 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 // Run from various go routines (JS consumer, etc..).
 // No lock held on entry.
 func (as *mqttAccountSessionManager) processRetainedMsg(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	fmt.Printf("<>/<> %v: processRetainedMsg: %q\n", c.srv, subject)
+
 	_, msg := c.msgParts(rmsg)
 	rm := &mqttRetainedMsg{}
 	if err := json.Unmarshal(msg, rm); err != nil {
@@ -4185,6 +4186,7 @@ func (c *client) mqttHandlePubRetain() {
 			Source:  c.opts.Username,
 		}
 		rmBytes, _ := json.Marshal(rm)
+		fmt.Printf("<>/<> mqttHandlePubRetain: storing retained message as %q\n", mqttRetainedMsgsStreamSubject+key)
 		smr, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, -1, rmBytes)
 		if err == nil {
 			// Update the new sequence

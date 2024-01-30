@@ -171,7 +171,7 @@ type ClusterInfo struct {
 // are supporting the stream or consumer.
 type PeerInfo struct {
 	Name    string        `json:"name"`
-	Current bool          `json:"current"`
+	Current bool          `json:"current"`    // <>/<> the one to check!!!!!!!!
 	Offline bool          `json:"offline,omitempty"`
 	Active  time.Duration `json:"active"`
 	Lag     uint64        `json:"lag,omitempty"`
