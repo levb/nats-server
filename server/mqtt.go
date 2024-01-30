@@ -1225,8 +1225,8 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
 	// that a user would allow permissions on.
 	rmsubj := mqttSubPrefix + nuid.Next()
-	rmsubjSubscribe := rmsubj + ".>"
-	rmsubjPublish := rmsubj // + "." + s.String()
+	rmsubjSubscribe := rmsubj // + ".>"
+	rmsubjPublish := rmsubj   // + "." + s.String()
 	if err := as.createSubscription(rmsubjSubscribe, as.processRetainedMsg, &sid, &subs); err != nil {
 		return nil, err
 	}

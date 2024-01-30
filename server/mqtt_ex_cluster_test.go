@@ -18,9 +18,11 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -39,28 +41,7 @@ func TestMQTTExCompliance(t *testing.T) {
 	o = s.getOpts()
 	defer testMQTTShutdownServer(s)
 
-	cmd := exec.Command(mqttCLICommandPath, "", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
-
-	output, err := cmd.CombinedOutput()
-	t.Log(string(output))
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			t.Fatalf("mqtt cli exited with error: %v", exitError)
-		}
-	}
-}
-
-func TestMQTTExXXX(t *testing.T) {
-	if mqttCLICommandPath == "" {
-		t.Skip(`"mqtt" command is not found in $PATH nor $MQTT_CLI. See https://hivemq.github.io/mqtt-cli/docs/installation/#debian-package for installation instructions`)
-	}
-
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	o = s.getOpts()
-	defer testMQTTShutdownServer(s)
-
-	cmd := exec.Command(mqttCLICommandPath, "", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
+	cmd := exec.Command(mqttCLICommandPath, "test", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
 
 	output, err := cmd.CombinedOutput()
 	t.Log(string(output))
@@ -80,14 +61,14 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 		name  string
 		makef func(t *testing.T) ([]testMQTTTarget, func())
 	}{
-		{
-			name:  "single server",
-			makef: testMQTTmakeSingleServer,
-		},
 		// {
-		// 	name:  "server with leafnode",
-		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
+		// 	name:  "single server",
+		// 	makef: testMQTTmakeSingleServer,
 		// },
+		{
+			name:  "server with leafnode",
+			makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
+		},
 		// {
 		// 	name:  "server with leafnode no domains",
 		// 	makef: testMQTTmakeServerWithLeafnode("", "", true),
@@ -120,18 +101,69 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				t.SkipNow()
 			}
 
-			t.Run("init at "+targets[0].name, func(t *testing.T) {
-				mqttInitServer(t, targets[0].dial[0])
-			})
+			// t.Run("init at "+targets[0].name, func(t *testing.T) {
+			// 	mqttInitServer(t, targets[0].dial[0])
+			// })
 
 			for _, target := range targets {
 				t.Run(target.name, func(t *testing.T) {
-					mqttRunTestCommand(t, "subret", target.dial,
-						"--qos", "0",
-						"--n", "1", // number of subscribe requests
-						"--num-topics", "2",
-						"--size", "100",
+					// mqttRunTestCommand(t, "subret", target.dial,
+					// 	"--qos", "0",
+					// 	"--n", "1", // number of subscribe requests
+					// 	"--num-topics", "1",
+					// 	"--size", "100",
+					// )
+					i := 0
+					dial := target.dial[i%len(target.dial)]
+					i++
+					u, p, h, port := parsedial(dial)
+
+					cmd := exec.Command(mqttCLICommandPath, "publish",
+						"-d",
+						"-V", "3",
+						"--user", u,
+						"--password", p,
+						"--host", h,
+						"--port", port,
+						"--message", "hello",
+						"--topic", "foo",
+						"--retain",
 					)
+					t.Log(cmd.String())
+
+					output, err := cmd.CombinedOutput()
+					t.Log(string(output))
+					if err != nil {
+						if exitError, ok := err.(*exec.ExitError); ok {
+							t.Fatalf("mqtt cli exited with error: %v", exitError)
+						}
+					}
+
+					dial = target.dial[i%len(target.dial)]
+					i++
+					u, p, h, port = parsedial(dial)
+
+					cmd = exec.Command(mqttCLICommandPath, "subscribe",
+						"-V", "3",
+						"--user", u,
+						"--password", p,
+						"--host", h,
+						"--port", port,
+						"--topic", "foo",
+					)
+					t.Log(cmd.String())
+
+					output, err = cmd.CombinedOutput()
+					t.Log(string(output))
+					if err != nil {
+						if exitError, ok := err.(*exec.ExitError); ok {
+							t.Fatalf("mqtt cli exited with error: %v", exitError)
+						}
+					}
+
+					if !strings.HasSuffix(string(output), "hello") {
+						t.Fatalf("expected retained message to be received")
+					}
 				})
 			}
 		})
@@ -488,3 +520,17 @@ func testMQTTmakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAcc
 // 		sc.shutdown()
 // 	}
 // }
+
+func parsedial(dial string) (username, password, host, port string) {
+	ss := strings.Split(dial, "@")
+	if len(ss) > 1 {
+		pp := strings.Split(ss[0], ":")
+		if len(pp) > 1 {
+			password = pp[1]
+		}
+		username = pp[0]
+		dial = ss[1]
+	}
+	host, port, _ = net.SplitHostPort(dial)
+	return username, password, host, port
+}
