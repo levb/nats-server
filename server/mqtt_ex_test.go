@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/nats-io/nuid"
 )
@@ -60,14 +59,14 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 		name  string
 		makef func(t *testing.T) ([]mqttexTarget, func())
 	}{
-		// {
-		// 	name:  "single server",
-		// 	makef: testMQTTmakeSingleServer,
-		// },
 		{
-			name:  "server with leafnode",
-			makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
+			name:  "single server",
+			makef: testMQTTmakeSingleServer,
 		},
+		// {
+		// 	name:  "server with leafnode",
+		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
+		// },
 		// {
 		// 	name:  "server with leafnode no domains",
 		// 	makef: testMQTTmakeServerWithLeafnode("", "", true),
@@ -120,10 +119,24 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 						iNode++
 					}
 
-					time.Sleep(500 * time.Millisecond) // <>/<>
-
 					for _, node := range target.subNodes {
 						t.Run(fmt.Sprintf("subscribe at %s", node.Name()), func(t *testing.T) {
+							mqttexRunTestOnNodes(t, "sub", []mqttexNode{node},
+								"--retained", strNumRMS,
+								"--qos", "0",
+								"--topic", topic,
+							)
+						})
+					}
+
+					for _, node := range target.subNodes {
+						t.Run(fmt.Sprintf("Reload %s", node.Name()), func(t *testing.T) {
+							node.Reload(t)
+						})
+					}
+
+					for _, node := range target.subNodes {
+						t.Run(fmt.Sprintf("subscribe again at %s", node.Name()), func(t *testing.T) {
 							mqttexRunTestOnNodes(t, "sub", []mqttexNode{node},
 								"--retained", strNumRMS,
 								"--qos", "0",
@@ -475,6 +488,13 @@ func (n *mqttexNode) String() string {
 
 func (n *mqttexNode) Name() string {
 	return n.server.Name()
+}
+
+func (n *mqttexNode) Reload(tb testing.TB) {
+	s := n.server
+	o := s.getOpts()
+	s.Shutdown()
+	n.server = testMQTTRunServer(tb, o)
 }
 
 type mqttexTarget struct {
