@@ -1076,7 +1076,6 @@ func mqttParsePubRelNATSHeader(headerBytes []byte) uint16 {
 // If new, creates the required JetStream streams/consumers
 // for handling of sessions and messages.
 func (s *Server) getOrCreateMQTTAccountSessionManager(clientID string, c *client) (*mqttAccountSessionManager, error) {
-	fmt.Printf("<>/<> %s: getOrCreateMQTTAccountSessionManager: %q\n", s, clientID)
 	sm := &s.mqtt.sessmgr
 
 	c.mu.Lock()
@@ -1176,10 +1175,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.domainTk = d + "."
 	}
 	if as.jsa.domainSet {
-		fmt.Printf("<>/<> %s: Ensuring MQTT streams/consumers with replicas %v for account %q in domain %q\n", s, replicas, accName, as.jsa.domain)
+		fmt.Printf("<>/<> %s: Ensuring MQTT streams/consumers with replicas %v for account %q in domain %q, USING %q\n", s, replicas, accName, as.jsa.domain, c.String())
 		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q in domain %q", replicas, accName, as.jsa.domain)
 	} else {
-		fmt.Printf("<>/<> %s: Ensuring MQTT streams/consumers with replicas %v for account %q\n", s, replicas, accName)
+		fmt.Printf("<>/<> %s: Ensuring MQTT streams/consumers with replicas %v for account %q, USING %q\n", s, replicas, accName, c.String())
 		s.Noticef("Ensuring MQTT streams/consumers with replicas %v for account %q", replicas, accName)
 	}
 
@@ -1225,11 +1224,12 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// We create the subscription on "$MQTT.sub.<nuid>" to limit the subjects
 	// that a user would allow permissions on.
 	rmsubj := mqttSubPrefix + nuid.Next()
-	rmsubjSubscribe := rmsubj // + ".>"
-	rmsubjPublish := rmsubj   // + "." + s.String()
-	if err := as.createSubscription(rmsubjSubscribe, as.processRetainedMsg, &sid, &subs); err != nil {
+	// rmsubjSubscribe := rmsubj // + ".>"
+	// rmsubjPublish := rmsubj   // + "." + s.String()
+	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
 		return nil, err
 	}
+	fmt.Printf("<>/<> %s: mqttCreateAccountSessionManager: subscribed to:%q\n", s, rmsubj)
 
 	// Create a subscription to be notified of retained messages delete requests.
 	rmdelsubj := mqttJSARepliesPrefix + "*." + mqttJSARetainedMsgDel
@@ -1272,7 +1272,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			s.Warnf("MQTT %s stream replicas mismatch: current is %v but configuration is %v for '%s > %s'",
 				txt, sr, replicas, accName, stream)
 		}
-		fmt.Printf("<>/<> %s: found %+v\n", s, si)
+		fmt.Printf("<>/<> %s: mqttCreateAccountSessionManager: found %+v\n", s, si)
 		return si, nil
 	}
 
@@ -1483,7 +1483,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if _, err := jsa.createConsumer(ccfg); err != nil {
 		return nil, fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 	}
-	fmt.Printf("<>/<> %s: !!! created retained messages consumer %q filter:%q, pub %q->%q in %v\n", s, rmDurName, ccfg.Config.FilterSubject, rmsubjPublish, rmsubjSubscribe, time.Since(start))
+	fmt.Printf("<>/<> %s: mqttCreateAccountSessionManager: created retained messages consumer %q filter:%q, subject:%q in %v\n", s, rmDurName, ccfg.Config.FilterSubject, rmsubj, time.Since(start))
 
 	if lastSeq > 0 {
 		ttl := time.NewTimer(mqttJSAPITimeout)
@@ -2234,6 +2234,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 // with the provided information.
 // Lock not held on entry.
 func (as *mqttAccountSessionManager) handleRetainedMsg(key string, rf *mqttRetainedMsgRef, rm *mqttRetainedMsg, copyBytesToCache bool) {
+	// fmt.Printf("<>/<> %s: handleRetainedMsg: key %q\n", as.jsa.c.srv, key)
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.retmsgs == nil {
@@ -2708,6 +2709,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		c.mu.Lock()
 		sub.mqtt.prm = append(sub.mqtt.prm, headerBytes, rm.Msg)
 		c.mu.Unlock()
+		// fmt.Printf("<>/<> %v: serializeRetainedMsgsForSub: added to prm: %v\n", c.srv, string(psub.subject))
 		if trace {
 			toTrace = append(toTrace, mqttPublish{
 				topic: []byte(rm.Topic),
@@ -2765,15 +2767,19 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]st
 		}
 	}
 
+	fmt.Printf("<>/<> %v: loadRetainedMessages: loaded %v from rmsCache\n", as.jsa.c.srv, len(rms))
+
 	if len(ss) == 0 {
 		return rms
 	}
 
+	fmt.Printf("<>/<> %v: loadRetainedMessages: need to load %q from JS\n", as.jsa.c.srv, ss)
 	results, err := as.jsa.loadLastMsgForMulti(mqttRetainedMsgsStreamName, ss)
 	// If an error occurred, warn, but then proceed with what we got.
 	if err != nil {
 		w.Warnf("error loading retained messages: %v", err)
 	}
+	fmt.Printf("<>/<> %v: loadRetainedMessages: loaded %v from JS\n", as.jsa.c.srv, len(results))
 	for i, result := range results {
 		if result == nil {
 			continue // skip requests that timed out
@@ -2793,6 +2799,7 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]st
 		as.setCachedRetainedMsg(key, &rm, false, false)
 		rms[key] = &rm
 	}
+	fmt.Printf("<>/<> %v: loadRetainedMessages: return %v RMS\n", as.jsa.c.srv, len(rms))
 	return rms
 }
 
@@ -4195,7 +4202,7 @@ func (c *client) mqttHandlePubRetain() {
 			Source:  c.opts.Username,
 		}
 		rmBytes, _ := json.Marshal(rm)
-		fmt.Printf("<>/<> mqttHandlePubRetain: storing retained message as %q\n", mqttRetainedMsgsStreamSubject+key)
+		// fmt.Printf("<>/<> %s: mqttHandlePubRetain: storing retained message as %q\n", c.srv, mqttRetainedMsgsStreamSubject+key)
 		smr, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, -1, rmBytes)
 		if err == nil {
 			// Update the new sequence
@@ -4790,6 +4797,8 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 
 	cc.mu.Lock()
 	if sub.mqtt.prm != nil {
+		fmt.Printf("<>/<> %v: mqttEnqueuePublishMsgTo: len(prm): %v chunks\n", c.srv, len(sub.mqtt.prm))
+
 		for _, data := range sub.mqtt.prm {
 			cc.queueOutbound(data)
 		}
@@ -5088,6 +5097,7 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 	c.mu.Lock()
 	for _, sub := range subs {
 		if sub.mqtt != nil && sub.mqtt.prm != nil {
+			fmt.Printf("<>/<> %v: mqttEnqueuePublishMsgTo: len(prm): %v chunks to %s\n", c.srv, len(sub.mqtt.prm), c.String())
 			for _, data := range sub.mqtt.prm {
 				c.queueOutbound(data)
 			}

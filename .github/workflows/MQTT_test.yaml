@@ -1,9 +1,9 @@
 name: MQTTEx
 on: [push, pull_request]
 
-permissions:
-  pull-requests: write # to comment on PRs
-  contents: write # to comment on commits (to upload artifacts?)
+# permissions:
+#   pull-requests: write # to comment on PRs
+#   contents: write # to comment on commits (to upload artifacts?)
 
 jobs:
   test:
