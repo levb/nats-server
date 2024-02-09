@@ -17,554 +17,328 @@
 package server
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
 	"strconv"
 	"testing"
-
-	"github.com/nats-io/nuid"
+	"time"
 )
 
-func TestMQTTExCompliance(t *testing.T) {
-	if mqttexCLICommandPath == "" {
-		t.Skip(`"mqtt" command is not found in $PATH nor $MQTT_CLI. See https://hivemq.github.io/mqtt-cli/docs/installation/#debian-package for installation instructions`)
+func mqttInitServer(tb testing.TB, server string) {
+	tb.Helper()
+	mqttexRunTest(tb, "pubsub", []string{server}, "", "",
+		"--id", "__init__",
+		"--qos", "0",
+		"--n", "1",
+		"--size", "100",
+		"--num-subscribers", "1")
+}
+
+const (
+	KB = 1024
+)
+
+type mqttBenchMatrix struct {
+	QOS         []int
+	MessageSize []int
+	Topics      []int
+	Publishers  []int
+	Subscribers []int
+}
+
+type mqttBenchContext struct {
+	QOS         int
+	MessageSize int
+	Topics      int
+	Publishers  int
+	Subscribers int
+
+	Host string
+	Port int
+}
+
+var mqttBenchDefaultMatrix = mqttBenchMatrix{
+	QOS:         []int{0, 1, 2},
+	MessageSize: []int{100, 1 * KB, 10 * KB},
+	Topics:      []int{100},
+	Publishers:  []int{1},
+	Subscribers: []int{1},
+}
+
+type MQTTBenchmarkResult struct {
+	Ops   int                      `json:"ops"`
+	NS    map[string]time.Duration `json:"ns"`
+	Bytes int64                    `json:"bytes"`
+}
+
+func BenchmarkMQTTEx(b *testing.B) {
+	if mqttexTestCommandPath == "" {
+		b.Skip(`"mqtt-test" command is not found in $PATH.`)
 	}
 
+	bc := mqttBenchContext{}
+	b.Run("Server", func(b *testing.B) {
+		b.Cleanup(bc.startServer(b, false))
+		bc.runAll(b)
+	})
+
+	b.Run("Cluster", func(b *testing.B) {
+		b.Cleanup(bc.startCluster(b, false))
+		bc.runAll(b)
+	})
+
+	b.Run("Server-no-RMSCache", func(b *testing.B) {
+		b.Cleanup(bc.startServer(b, true))
+
+		bc.benchmarkSubRet(b)
+	})
+
+	b.Run("Cluster-no-RMSCache", func(b *testing.B) {
+		b.Cleanup(bc.startCluster(b, true))
+
+		bc.benchmarkSubRet(b)
+	})
+}
+
+func (bc mqttBenchContext) runAll(b *testing.B) {
+	bc.benchmarkPub(b)
+	bc.benchmarkPubRetained(b)
+	bc.benchmarkPubSub(b)
+	bc.benchmarkSubRet(b)
+}
+
+// makes a copy of bc
+func (bc mqttBenchContext) benchmarkPub(b *testing.B) {
+	m := mqttBenchDefaultMatrix.
+		NoSubscribers().
+		NoTopics()
+
+	b.Run("PUB", func(b *testing.B) {
+		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
+			bc.runAndReport(b, "pub",
+				"--qos", strconv.Itoa(bc.QOS),
+				"--n", strconv.Itoa(b.N),
+				"--size", strconv.Itoa(bc.MessageSize),
+				"--num-publishers", strconv.Itoa(bc.Publishers),
+			)
+		})
+	})
+}
+
+// makes a copy of bc
+func (bc mqttBenchContext) benchmarkPubRetained(b *testing.B) {
+	// This bench is meaningless for QOS0 since the client considers the message
+	// sent as soon as it's written out. It is also useless for QOS2 since the
+	// flow takes a lot longer, and the difference of publishing as retained or
+	// not is lost in the noise.
+	m := mqttBenchDefaultMatrix.
+		NoSubscribers().
+		NoTopics().
+		QOS1Only()
+
+	b.Run("PUBRET", func(b *testing.B) {
+		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
+			bc.runAndReport(b, "pub", "--retain",
+				"--qos", strconv.Itoa(bc.QOS),
+				"--n", strconv.Itoa(b.N),
+				"--size", strconv.Itoa(bc.MessageSize),
+				"--num-publishers", strconv.Itoa(bc.Publishers),
+			)
+		})
+	})
+}
+
+// makes a copy of bc
+func (bc mqttBenchContext) benchmarkPubSub(b *testing.B) {
+	// This test uses a single built-in topic, and a built-in publisher, so no
+	// reason to run it for topics and publishers.
+	m := mqttBenchDefaultMatrix.
+		NoTopics().
+		NoPublishers()
+
+	b.Run("PUBSUB", func(b *testing.B) {
+		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
+			bc.runAndReport(b, "pubsub",
+				"--qos", strconv.Itoa(bc.QOS),
+				"--n", strconv.Itoa(b.N),
+				"--size", strconv.Itoa(bc.MessageSize),
+				"--num-subscribers", strconv.Itoa(bc.Subscribers),
+			)
+		})
+	})
+}
+
+// makes a copy of bc
+func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
+	// This test uses a a built-in publisher, and it makes most sense to measure
+	// the retained message delivery "overhead" on a QoS0 subscription; without
+	// the extra time involved in actually subscribing.
+	m := mqttBenchDefaultMatrix.
+		NoPublishers().
+		QOS0Only()
+
+	b.Run("SUBRET", func(b *testing.B) {
+		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
+			bc.runAndReport(b, "subret",
+				"--qos", strconv.Itoa(bc.QOS),
+				"--n", strconv.Itoa(b.N), // number of subscribe requests
+				"--num-subscribers", strconv.Itoa(bc.Subscribers),
+				"--num-topics", strconv.Itoa(bc.Topics),
+				"--size", strconv.Itoa(bc.MessageSize),
+			)
+		})
+	})
+}
+
+func (bc mqttBenchContext) runAndReport(b *testing.B, name string, extraArgs ...string) {
+	b.Helper()
+	r := mqttexRunTest(b, name, []string{fmt.Sprintf("%s:%d", bc.Host, bc.Port)}, extraArgs...)
+	r.report(b)
+}
+
+func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func() {
+	b.Helper()
+	b.StopTimer()
+	prevDisableRMSCache := testDisableRMSCache
+	testDisableRMSCache = disableRMSCache
 	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
+	s := testMQTTRunServer(b, o)
+
 	o = s.getOpts()
-	defer testMQTTShutdownServer(s)
-
-	cmd := exec.Command(mqttexCLICommandPath, "test", "-V", "3", "-p", strconv.Itoa(o.MQTT.Port))
-
-	output, err := cmd.CombinedOutput()
-	t.Log(string(output))
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			t.Fatalf("mqtt cli exited with error: %v", exitError)
-		}
+	bc.Host = o.MQTT.Host
+	bc.Port = o.MQTT.Port
+	mqttInitServer(b, fmt.Sprintf("mqtt://%s:%d", bc.Host, bc.Port))
+	return func() {
+		testMQTTShutdownServer(s)
+		testDisableRMSCache = prevDisableRMSCache
 	}
 }
 
-func TestMQTTExRetainedMessages(t *testing.T) {
-	if mqttexTestCommandPath == "" {
-		t.Skip(`"mqtt-test" command is not found in $PATH.`)
-	}
-
-	for _, topo := range []struct {
-		name  string
-		makef func(t *testing.T) ([]mqttexTarget, func())
-	}{
-		{
-			name:  "single server",
-			makef: testMQTTmakeSingleServer,
-		},
-		// {
-		// 	name:  "server with leafnode",
-		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
-		// },
-		// {
-		// 	name:  "server with leafnode no domains",
-		// 	makef: testMQTTmakeServerWithLeafnode("", "", true),
-		// },
-		// {
-		// 	name:  "server with leafnode no system account",
-		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", false),
-		// },
-		// {
-		// 	name:  "cluster",
-		// 	makef: testMQTTmakeCluster(4, ""),
-		// },
-		// {
-		// 	name:  "cluster with leafnode cluster",
-		// 	makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
-		// },
-		// {
-		// 	name:  "cluster with leafnode cluster no system account",
-		// 	makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", false),
-		// },
-		// {
-		// 	name:  "supercluster with leafnode cluster",
-		// 	makef: testMQTTmakeSuperClusterWithLeafnodeCluster,
-		// },
-	} {
-		t.Run(topo.name, func(t *testing.T) {
-			targets, cleanup := topo.makef(t)
-			t.Cleanup(cleanup)
-			if len(targets) == 0 {
-				t.SkipNow()
-			}
-
-			numRMS := 10
-			strNumRMS := "10"
-			for _, target := range targets {
-				t.Run(target.name, func(t *testing.T) {
-					topic := "subret_" + nuid.Next()
-
-					// publish retained messages, one at a time, round-robin across pubNodes.
-					iNode := 0
-					for i := 0; i < numRMS; i++ {
-						pubTopic := fmt.Sprintf("%s/%d", topic, i)
-						pubNode := target.pubNodes[iNode%len(target.pubNodes)]
-						mqttexRunTestOnNodes(t, "pub", []mqttexNode{pubNode},
-							"--retain",
-							"--topic", pubTopic,
-							"--qos", "0",
-							"--size", "100",
-						)
-						iNode++
-					}
-
-					for _, node := range target.subNodes {
-						t.Run(fmt.Sprintf("subscribe at %s", node.Name()), func(t *testing.T) {
-							mqttexRunTestOnNodes(t, "sub", []mqttexNode{node},
-								"--retained", strNumRMS,
-								"--qos", "0",
-								"--topic", topic,
-							)
-						})
-					}
-
-					for _, node := range target.subNodes {
-						t.Run(fmt.Sprintf("Reload %s", node.Name()), func(t *testing.T) {
-							node.Reload(t)
-						})
-					}
-
-					for _, node := range target.subNodes {
-						t.Run(fmt.Sprintf("subscribe again at %s", node.Name()), func(t *testing.T) {
-							mqttexRunTestOnNodes(t, "sub", []mqttexNode{node},
-								"--retained", strNumRMS,
-								"--qos", "0",
-								"--topic", topic,
-							)
-						})
-					}
-				})
-			}
-		})
-	}
-}
-
-func testMQTTmakeSingleServer(t *testing.T) ([]mqttexTarget, func()) {
-	t.Helper()
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	node := mqttexNode{server: s}
-	return []mqttexTarget{
-			{
-				name:     s.info.Name,
-				pubNodes: []mqttexNode{node},
-				subNodes: []mqttexNode{node},
-			},
-		},
-		func() {
-			testMQTTShutdownServer(s)
-		}
-}
-
-func testMQTTmakeServerWithLeafnode(hubd, leafd string, connectSystemAccount bool) func(t *testing.T) ([]mqttexTarget, func()) {
-	return func(t *testing.T) ([]mqttexTarget, func()) {
-		t.Helper()
-
-		if hubd != "" {
-			hubd = "domain: " + hubd + ", "
-		}
-		sconf := `
-listen: 127.0.0.1:-1
-
-server_name: HUB
-jetstream: {max_mem_store: 256MB, max_file_store: 2GB, ` + hubd + `store_dir: '` + t.TempDir() + `'}
-
-leafnodes {
-	listen: 127.0.0.1:-1
-}
-
-accounts {
-	ONE { users = [ { user: "one", pass: "p" } ]; jetstream: enabled }
-	$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
-}
-
-mqtt {
-	listen: 127.0.0.1:-1
-}
-`
-		serverConf := createConfFile(t, []byte(sconf))
-		s, o := RunServerWithConfig(serverConf)
-		leafRemoteAddr := fmt.Sprintf("%s:%d", o.LeafNode.Host, o.LeafNode.Port)
-		hubNode := mqttexNode{server: s, username: "one", password: "p"}
-
-		sysRemote := ""
-		if connectSystemAccount {
-			sysRemote = `{ url: "nats://admin:s3cr3t!@` + leafRemoteAddr + `", account: "$SYS" },` + "\n\t\t"
-		}
-		if leafd != "" {
-			leafd = "domain: " + leafd + ", "
-		}
-		leafconf := `
-listen: 127.0.0.1:-1
-
-server_name: SPOKE
-jetstream: {max_mem_store: 256MB, max_file_store: 2GB, ` + leafd + `store_dir: '` + t.TempDir() + `'}
-
-leafnodes {
-	remotes = [
-		` + sysRemote + `{ url: "nats://one:p@` + leafRemoteAddr + `", account: "ONE" },
-	]
-}
-
-accounts {
-	ONE { users = [ { user: "one", pass: "p" } ]; jetstream: enabled }
-	$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
-}
-
-mqtt {
-	listen: 127.0.0.1:-1
-}
-`
-		leafConf := createConfFile(t, []byte(leafconf))
-		leafs, _ := RunServerWithConfig(leafConf)
-		spokeNode := mqttexNode{server: leafs, username: "one", password: "p"}
-
-		var targets []mqttexTarget
-		targets = append(targets, mqttexTarget{
-			name:     "pub to all",
-			pubNodes: []mqttexNode{hubNode, spokeNode},
-			subNodes: []mqttexNode{hubNode, spokeNode},
-		})
-		// targets = append(targets, mqttexTarget{
-		// 	name:     "pub to SPOKE",
-		// 	pubNodes: []mqttexNode{spokeNode},
-		// 	subNodes: []mqttexNode{hubNode, spokeNode},
-		// })
-		// targets = append(targets, mqttexTarget{
-		// 	name:     "pub to HUB",
-		// 	pubNodes: []mqttexNode{hubNode},
-		// 	subNodes: []mqttexNode{hubNode, spokeNode},
-		// })
-
-		return targets, func() {
-			testMQTTShutdownServer(leafs)
-			testMQTTShutdownServer(s)
-			os.Remove(serverConf)
-			os.Remove(leafConf)
-		}
-	}
-}
-
-func testMQTTmakeCluster(size int, domain string) func(t *testing.T) ([]mqttexTarget, func()) {
-	return func(t *testing.T) ([]mqttexTarget, func()) {
-		t.Helper()
-		if size < 3 {
-			t.Fatal("cluster size must be at least 3")
-		}
-
-		if domain != "" {
-			domain = "domain: " + domain + ", "
-		}
-		clusterConf := `
-	listen: 127.0.0.1:-1
-
-	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, ` + domain + `store_dir: '%s'}
-
-	leafnodes {
+func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) func() {
+	b.Helper()
+	b.StopTimer()
+	prevDisableRMSCache := testDisableRMSCache
+	testDisableRMSCache = disableRMSCache
+	conf := `
 		listen: 127.0.0.1:-1
-	}
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
 
-	cluster {
-		name: %s
-		listen: 127.0.0.1:%d
-		routes = [%s]
-	}
-
-	mqtt {
-		listen: 127.0.0.1:-1
-		stream_replicas: 3
-	}
-
-	accounts {
-		ONE { users = [ { user: "one", pass: "p" } ]; jetstream: enabled }
-		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
-	}
-`
-		cl := createJetStreamClusterWithTemplate(t, clusterConf, "MQTT", size)
-		cl.waitOnLeader()
-
-		targetPubAll := mqttexTarget{
-			name: "publish to one",
-		}
-		for _, s := range cl.servers {
-			targetPubAll.subNodes = append(targetPubAll.subNodes, mqttexNode{server: s, username: "one", password: "p"})
-		}
-		targetPubAll.pubNodes = targetPubAll.subNodes
-
-		targetPubRandom := mqttexTarget{
-			name:     "publish to all",
-			pubNodes: []mqttexNode{{server: cl.randomServer(), username: "one", password: "p"}},
-			subNodes: targetPubAll.subNodes,
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
 		}
 
-		return []mqttexTarget{targetPubAll, targetPubRandom}, func() { cl.shutdown() }
+		mqtt {
+			listen: 127.0.0.1:-1
+			stream_replicas: 3
+		}
+
+		# For access to system account.
+		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+	`
+
+	cl := createJetStreamClusterWithTemplate(b, conf, "MQTT", 3)
+	o := cl.randomNonLeader().getOpts()
+	bc.Host = o.MQTT.Host
+	bc.Port = o.MQTT.Port
+	mqttInitServer(b, fmt.Sprintf("mqtt://%s:%d", bc.Host, bc.Port))
+	return func() {
+		cl.shutdown()
+		testDisableRMSCache = prevDisableRMSCache
 	}
 }
 
-func testMQTTmakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAccount bool) func(t *testing.T) ([]mqttexTarget, func()) {
-	return func(t *testing.T) ([]mqttexTarget, func()) {
-		t.Helper()
-
-		// Create HUB cluster.
-		if hubd != "" {
-			hubd = "domain: " + hubd + ", "
+func mqttBenchWrapForMatrixField(
+	vFieldPtr *int,
+	arr []int,
+	f func(b *testing.B, bc *mqttBenchContext),
+	namef func(int) string,
+) func(b *testing.B, bc *mqttBenchContext) {
+	if len(arr) == 0 {
+		return f
+	}
+	return func(b *testing.B, bc *mqttBenchContext) {
+		for _, value := range arr {
+			*vFieldPtr = value
+			b.Run(namef(value), func(b *testing.B) {
+				f(b, bc)
+			})
 		}
-		hubConf := `
-	listen: 127.0.0.1:-1
-
-	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, ` + hubd + `store_dir: '%s'}
-
-	leafnodes {
-		listen: 127.0.0.1:-1
-	}
-
-	cluster {
-		name: %s
-		listen: 127.0.0.1:%d
-		routes = [%s]
-	}
-
-	mqtt {
-		listen: 127.0.0.1:-1
-		stream_replicas: 3
-	}
-
-	accounts {
-		ONE { users = [ { user: "one", pass: "p" } ]; jetstream: enabled }
-		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
-	}
-`
-		hub := createJetStreamClusterWithTemplate(t, hubConf, "HUB", 3)
-		hub.waitOnLeader()
-
-		// Pick a host to connect leafnodes to
-		lno := hub.randomNonLeader().getOpts().LeafNode
-		leafRemoteAddr := fmt.Sprintf("%s:%d", lno.Host, lno.Port)
-		hubPubNode := mqttexNode{server: hub.randomNonLeader(), username: "one", password: "p"}
-		allNodes := []mqttexNode{}
-		for _, s := range hub.servers {
-			allNodes = append(allNodes, mqttexNode{server: s, username: "one", password: "p"})
-		}
-
-		// Create SPOKE (leafnode) cluster.
-		sysRemote := ""
-		if connectSystemAccount {
-			sysRemote = `{ url: "nats://admin:s3cr3t!@` + leafRemoteAddr + `", account: "$SYS" },` + "\n\t\t\t"
-		}
-		if leafd != "" {
-			leafd = "domain: " + leafd + ", "
-		}
-		leafConf := `
-	listen: 127.0.0.1:-1
-
-	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, ` + leafd + `store_dir: '%s'}
-
-	leafnodes {
-		remotes = [
-			` + sysRemote + `{ url: "nats://one:p@` + leafRemoteAddr + `", account: "ONE" },
-		]
-	}
-
-	cluster {
-		name: %s
-		listen: 127.0.0.1:%d
-		routes = [%s]
-	}
-
-	mqtt {
-		listen: 127.0.0.1:-1
-		stream_replicas: 3
-	}
-
-	accounts {
-		ONE { users = [ { user: "one", pass: "p" } ]; jetstream: enabled }
-		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
-	}
-`
-		spoke := createJetStreamCluster(t, leafConf, "SPOKE", "SPOKE-", 3, 22111, false)
-		expectedConnections := 2
-		if !connectSystemAccount {
-			expectedConnections = 1
-		}
-		for _, s := range spoke.servers {
-			checkLeafNodeConnectedCount(t, s, expectedConnections)
-		}
-		spoke.waitOnPeerCount(3)
-		spokePubNode := mqttexNode{server: spoke.randomNonLeader(), username: "one", password: "p"}
-		for _, s := range spoke.servers {
-			allNodes = append(allNodes, mqttexNode{server: s, username: "one", password: "p"})
-		}
-
-		return []mqttexTarget{
-				{
-					name:     "publish to all",
-					pubNodes: allNodes,
-					subNodes: allNodes,
-				},
-				{
-					name:     "publish to hub",
-					pubNodes: []mqttexNode{hubPubNode},
-					subNodes: allNodes,
-				},
-				{
-					name:     "publish to spoke",
-					pubNodes: []mqttexNode{spokePubNode},
-					subNodes: allNodes,
-				},
-			},
-			func() {
-				spoke.shutdown()
-				hub.shutdown()
-			}
 	}
 }
 
-// func testMQTTmakeSuperClusterWithLeafnodeCluster(t *testing.T) (testMQTTTarget, func()) {
-// 	t.Helper()
-
-// 	target := testMQTTTarget{
-// 		testName: "super cluster with leafnode cluster",
-// 	}
-
-// 	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterAccountsTempl, 3, 2,
-// 		func(_, _, _, conf string) string {
-// 			// set JetStream domain to "HUBDOMAIN"
-// 			conf = strings.Replace(conf, "store_dir:", "domain: HUBDOMAIN, store_dir:", 1)
-// 			// add MQTT config
-// 			conf = conf + "\n" + testMQTTClusterConf
-// 			return conf
-// 		},
-// 		nil)
-
-// 	for _, cl := range sc.clusters {
-// 		t.Log("<>/<> cluster", cl.name)
-// 		target.servers = testMQTTappendTargetServers(target.servers, cl.servers, cl.name)
-// 	}
-
-// 	leafCluster := sc.createLeafNodesWithDomain("LNC", 3, "LEAFDOMAIN")
-// 	target.servers = testMQTTappendTargetServers(target.servers, leafCluster.servers, leafCluster.name)
-
-// 	o := sc.clusters[0].servers[0].getOpts()
-// 	testMQTTinitJS(t, fmt.Sprintf("%s:%d", o.Host, o.MQTT.Port))
-
-// 	return target, func() {
-// 		leafCluster.shutdown()
-// 		sc.shutdown()
-// 	}
-// }
-
-type mqttexNode struct {
-	server   *Server
-	username string
-	password string
+func (m mqttBenchMatrix) runMatrix(b *testing.B, bc mqttBenchContext, f func(*testing.B, *mqttBenchContext)) {
+	b.Helper()
+	f = mqttBenchWrapForMatrixField(&bc.MessageSize, m.MessageSize, f, func(size int) string {
+		return sizeKB(size)
+	})
+	f = mqttBenchWrapForMatrixField(&bc.Topics, m.Topics, f, func(n int) string {
+		return fmt.Sprintf("%dtopics", n)
+	})
+	f = mqttBenchWrapForMatrixField(&bc.Publishers, m.Publishers, f, func(n int) string {
+		return fmt.Sprintf("%dpubc", n)
+	})
+	f = mqttBenchWrapForMatrixField(&bc.Subscribers, m.Subscribers, f, func(n int) string {
+		return fmt.Sprintf("%dsubc", n)
+	})
+	f = mqttBenchWrapForMatrixField(&bc.QOS, m.QOS, f, func(qos int) string {
+		return fmt.Sprintf("QOS%d", qos)
+	})
+	b.ResetTimer()
+	b.StartTimer()
+	f(b, &bc)
 }
 
-func (n *mqttexNode) String() string {
-	o := n.server.getOpts().MQTT
-
-	switch {
-	case n.username != "" && n.password != "":
-		return fmt.Sprintf("%s:%s@%s:%d#%s", n.username, n.password, o.Host, o.Port, n.server.Name())
-	case n.username != "":
-		return fmt.Sprintf("%s@%s:%d#%s", n.username, o.Host, o.Port, n.server.Name())
-	default:
-		return fmt.Sprintf("%s:%d#%s", o.Host, o.Port, n.server.Name())
-	}
+func (m mqttBenchMatrix) NoSubscribers() mqttBenchMatrix {
+	m.Subscribers = nil
+	return m
 }
 
-func (n *mqttexNode) Name() string {
-	return n.server.Name()
+func (m mqttBenchMatrix) NoTopics() mqttBenchMatrix {
+	m.Topics = nil
+	return m
 }
 
-func (n *mqttexNode) Reload(tb testing.TB) {
-	s := n.server
-	o := s.getOpts()
-	s.Shutdown()
-	n.server = testMQTTRunServer(tb, o)
+func (m mqttBenchMatrix) NoPublishers() mqttBenchMatrix {
+	m.Publishers = nil
+	return m
 }
 
-type mqttexTarget struct {
-	name     string
-	pubNodes []mqttexNode
-	subNodes []mqttexNode
+func (m mqttBenchMatrix) QOS0Only() mqttBenchMatrix {
+	m.QOS = []int{0}
+	return m
 }
 
-var mqttexCLICommandPath = func() string {
-	p := os.Getenv("MQTT_CLI")
-	if p == "" {
-		p, _ = exec.LookPath("mqtt")
-	}
-	return p
-}()
-
-var mqttexTestCommandPath = func() string {
-	p, _ := exec.LookPath("mqtt-test")
-	return p
-}()
-
-func mqttexRunTestOnNodes(tb testing.TB, subCommand string, nodes []mqttexNode, extraArgs ...string) *MQTTBenchmarkResult {
-	tb.Helper()
-
-	ss := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		ss = append(ss, n.String())
-	}
-	return mqttexRunTest(tb, subCommand, ss, extraArgs...)
+func (m mqttBenchMatrix) QOS1Only() mqttBenchMatrix {
+	m.QOS = []int{1}
+	return m
 }
 
-func mqttexRunTest(tb testing.TB, subCommand string, servers []string, extraArgs ...string) *MQTTBenchmarkResult {
-	tb.Helper()
+func sizeKB(size int) string {
+	unit := "B"
+	N := size
+	if size >= KB {
+		unit = "KB"
+		N = (N + KB/2) / KB
+	}
+	return fmt.Sprintf("%d%s", N, unit)
+}
 
-	if mqttexTestCommandPath == "" {
-		tb.Skip(`"mqtt-test" command is not found in $PATH.`)
-	}
+func (r MQTTBenchmarkResult) report(b *testing.B) {
+	// Disable the default ns metric in favor of custom X_ms/op.
+	b.ReportMetric(0, "ns/op")
 
-	args := []string{subCommand /*, "-q" */}
-	for _, s := range servers {
-		args = append(args, "-s", s)
-	}
+	// Disable MB/s since the github benchmarking action misinterprets the sign
+	// of the result (treats it as less is better).
+	b.SetBytes(0)
+	// b.SetBytes(r.Bytes)
 
-	args = append(args, extraArgs...)
-
-	cmd := exec.Command(mqttexTestCommandPath, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		tb.Fatalf("Error executing %q: %v", cmd.String(), err)
+	for unit, ns := range r.NS {
+		nsOp := float64(ns) / float64(r.Ops)
+		b.ReportMetric(nsOp/1000000, unit+"_ms/op")
 	}
-	defer stdout.Close()
-	errbuf := bytes.Buffer{}
-	cmd.Stderr = &errbuf
-	if err = cmd.Start(); err != nil {
-		tb.Fatalf("Error executing %q: %v", cmd.String(), err)
-	}
-	out, err := io.ReadAll(stdout)
-	if err != nil {
-		tb.Fatalf("Error executing %q: failed to read output: %v", cmd.String(), err)
-	}
-	if err = cmd.Wait(); err != nil {
-		tb.Fatalf("Error executing %q: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
-	}
-
-	tb.Logf("<>/<> Running %q", cmd.String())
-	// tb.Logf("<>/<> Output of %q:\n%s\n%s", cmd.String(), string(out), errbuf.String())
-
-	r := &MQTTBenchmarkResult{}
-	if err := json.Unmarshal(out, r); err != nil {
-		tb.Fatalf("Error executing %q: failed to decode output: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
-	}
-	return r
+	// Diable ReportAllocs() since it confuses the github benchmarking action
+	// with the noise.
+	// b.ReportAllocs()
 }
