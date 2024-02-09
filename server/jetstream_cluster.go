@@ -7234,7 +7234,6 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	}
 	sa.consumers[ca.Name] = ca
 
-	fmt.Printf("<>/<> %v: CREATE CONSUMER: %+v\n", s, ca)
 	// Do formal proposal.
 	cc.meta.Propose(eca)
 }
