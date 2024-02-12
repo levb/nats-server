@@ -25,12 +25,7 @@ import (
 
 func mqttInitServer(tb testing.TB, server string) {
 	tb.Helper()
-	mqttexRunTest(tb, "pubsub", []string{server}, "", "",
-		"--id", "__init__",
-		"--qos", "0",
-		"--n", "1",
-		"--size", "100",
-		"--num-subscribers", "1")
+	mqttexRunTest(tb, "pub", []string{server}, "--id", "__init__")
 }
 
 const (
@@ -116,9 +111,9 @@ func (bc mqttBenchContext) benchmarkPub(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
 			bc.runAndReport(b, "pub",
 				"--qos", strconv.Itoa(bc.QOS),
-				"--n", strconv.Itoa(b.N),
+				"--messages", strconv.Itoa(b.N),
 				"--size", strconv.Itoa(bc.MessageSize),
-				"--num-publishers", strconv.Itoa(bc.Publishers),
+				"--publishers", strconv.Itoa(bc.Publishers),
 			)
 		})
 	})
@@ -139,9 +134,9 @@ func (bc mqttBenchContext) benchmarkPubRetained(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
 			bc.runAndReport(b, "pub", "--retain",
 				"--qos", strconv.Itoa(bc.QOS),
-				"--n", strconv.Itoa(b.N),
+				"--messages", strconv.Itoa(b.N),
 				"--size", strconv.Itoa(bc.MessageSize),
-				"--num-publishers", strconv.Itoa(bc.Publishers),
+				"--publishers", strconv.Itoa(bc.Publishers),
 			)
 		})
 	})
@@ -159,9 +154,9 @@ func (bc mqttBenchContext) benchmarkPubSub(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
 			bc.runAndReport(b, "pubsub",
 				"--qos", strconv.Itoa(bc.QOS),
-				"--n", strconv.Itoa(b.N),
+				"--messages", strconv.Itoa(b.N),
 				"--size", strconv.Itoa(bc.MessageSize),
-				"--num-subscribers", strconv.Itoa(bc.Subscribers),
+				"--subscribers", strconv.Itoa(bc.Subscribers),
 			)
 		})
 	})
@@ -180,10 +175,10 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
 			bc.runAndReport(b, "subret",
 				"--qos", strconv.Itoa(bc.QOS),
-				"--n", strconv.Itoa(b.N), // number of subscribe requests
-				"--num-subscribers", strconv.Itoa(bc.Subscribers),
-				"--num-topics", strconv.Itoa(bc.Topics),
+				"--topics", strconv.Itoa(bc.Topics), // number of retained messages
+				"--subscribers", strconv.Itoa(bc.Subscribers),
 				"--size", strconv.Itoa(bc.MessageSize),
+				"--repeat", strconv.Itoa(b.N), // number of subscribe requests
 			)
 		})
 	})

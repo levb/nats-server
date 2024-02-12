@@ -63,34 +63,30 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 			name:  "single server",
 			makef: testMQTTmakeSingleServer,
 		},
-		// {
-		// 	name:  "server with leafnode",
-		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
-		// },
-		// {
-		// 	name:  "server with leafnode no domains",
-		// 	makef: testMQTTmakeServerWithLeafnode("", "", true),
-		// },
-		// {
-		// 	name:  "server with leafnode no system account",
-		// 	makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", false),
-		// },
-		// {
-		// 	name:  "cluster",
-		// 	makef: testMQTTmakeCluster(4, ""),
-		// },
-		// {
-		// 	name:  "cluster with leafnode cluster",
-		// 	makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
-		// },
-		// {
-		// 	name:  "cluster with leafnode cluster no system account",
-		// 	makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", false),
-		// },
-		// {
-		// 	name:  "supercluster with leafnode cluster",
-		// 	makef: testMQTTmakeSuperClusterWithLeafnodeCluster,
-		// },
+		{
+			name:  "server with leafnode",
+			makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", true),
+		},
+		{
+			name:  "server with leafnode no domains",
+			makef: testMQTTmakeServerWithLeafnode("", "", true),
+		},
+		{
+			name:  "server with leafnode no system account",
+			makef: testMQTTmakeServerWithLeafnode("HUBD", "LEAFD", false),
+		},
+		{
+			name:  "cluster",
+			makef: testMQTTmakeCluster(4, ""),
+		},
+		{
+			name:  "cluster with leafnode cluster",
+			makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
+		},
+		{
+			name:  "cluster with leafnode cluster no system account",
+			makef: testMQTTmakeClusterWithLeafnodeCluster("HUBD", "LEAFD", false),
+		},
 	} {
 		t.Run(topo.name, func(t *testing.T) {
 			targets, cleanup := topo.makef(t)
@@ -433,40 +429,6 @@ func testMQTTmakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAcc
 	}
 }
 
-// func testMQTTmakeSuperClusterWithLeafnodeCluster(t *testing.T) (testMQTTTarget, func()) {
-// 	t.Helper()
-
-// 	target := testMQTTTarget{
-// 		testName: "super cluster with leafnode cluster",
-// 	}
-
-// 	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterAccountsTempl, 3, 2,
-// 		func(_, _, _, conf string) string {
-// 			// set JetStream domain to "HUBDOMAIN"
-// 			conf = strings.Replace(conf, "store_dir:", "domain: HUBDOMAIN, store_dir:", 1)
-// 			// add MQTT config
-// 			conf = conf + "\n" + testMQTTClusterConf
-// 			return conf
-// 		},
-// 		nil)
-
-// 	for _, cl := range sc.clusters {
-// 		t.Log("<>/<> cluster", cl.name)
-// 		target.servers = testMQTTappendTargetServers(target.servers, cl.servers, cl.name)
-// 	}
-
-// 	leafCluster := sc.createLeafNodesWithDomain("LNC", 3, "LEAFDOMAIN")
-// 	target.servers = testMQTTappendTargetServers(target.servers, leafCluster.servers, leafCluster.name)
-
-// 	o := sc.clusters[0].servers[0].getOpts()
-// 	testMQTTinitJS(t, fmt.Sprintf("%s:%d", o.Host, o.MQTT.Port))
-
-// 	return target, func() {
-// 		leafCluster.shutdown()
-// 		sc.shutdown()
-// 	}
-// }
-
 type mqttexNode struct {
 	server   *Server
 	username string
@@ -558,9 +520,6 @@ func mqttexRunTest(tb testing.TB, subCommand string, servers []string, extraArgs
 	if err = cmd.Wait(); err != nil {
 		tb.Fatalf("Error executing %q: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
 	}
-
-	tb.Logf("<>/<> Running %q", cmd.String())
-	// tb.Logf("<>/<> Output of %q:\n%s\n%s", cmd.String(), string(out), errbuf.String())
 
 	r := &MQTTBenchmarkResult{}
 	if err := json.Unmarshal(out, r); err != nil {
