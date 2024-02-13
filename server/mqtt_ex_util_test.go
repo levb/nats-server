@@ -27,32 +27,32 @@ import (
 	"testing"
 )
 
-type testMQTTExDial string
+type mqttExDial string
 
-type testMQTTExTarget struct {
+type mqttExTarget struct {
 	servers  []*Server
 	clusters []*cluster
-	configs  []testMQTTExTestConfig
-	all      []testMQTTExDial
+	configs  []mqttExTestConfig
+	all      []mqttExDial
 }
 
-type testMQTTExTestConfig struct {
+type mqttExTestConfig struct {
 	name string
-	pub  []testMQTTExDial
-	sub  []testMQTTExDial
+	pub  []mqttExDial
+	sub  []mqttExDial
 }
 
-func testMQTTExInitServer(tb testing.TB, dial testMQTTExDial) {
+func mqttExInitServer(tb testing.TB, dial mqttExDial) {
 	tb.Helper()
 	mqttexRunTest(tb, "pub", dial, "--id", "__init__")
 }
 
-func testMQTTExNewDialForServer(s *Server, username, password string) testMQTTExDial {
+func mqttExNewDialForServer(s *Server, username, password string) mqttExDial {
 	o := s.getOpts().MQTT
-	return testMQTTExNewDial(username, password, o.Host, o.Port, s.Name())
+	return mqttExNewDial(username, password, o.Host, o.Port, s.Name())
 }
 
-func testMQTTExNewDial(username, password, host string, port int, comment string) testMQTTExDial {
+func mqttExNewDial(username, password, host string, port int, comment string) mqttExDial {
 	d := ""
 	switch {
 	case username != "" && password != "":
@@ -65,10 +65,10 @@ func testMQTTExNewDial(username, password, host string, port int, comment string
 	if comment != "" {
 		d += "#" + comment
 	}
-	return testMQTTExDial(d)
+	return mqttExDial(d)
 }
 
-func (d testMQTTExDial) Get() (u, p, s, c string) {
+func (d mqttExDial) Get() (u, p, s, c string) {
 	if d == "" {
 		return "", "", "127.0.0.1:1883", ""
 	}
@@ -90,7 +90,7 @@ func (d testMQTTExDial) Get() (u, p, s, c string) {
 	return u, p, s, c
 }
 
-func (t *testMQTTExTarget) Reload(tb testing.TB) {
+func (t *mqttExTarget) Reload(tb testing.TB) {
 	tb.Helper()
 
 	for _, c := range t.clusters {
@@ -104,7 +104,7 @@ func (t *testMQTTExTarget) Reload(tb testing.TB) {
 	}
 }
 
-func (t *testMQTTExTarget) Shutdown() {
+func (t *mqttExTarget) Shutdown() {
 	for _, c := range t.clusters {
 		c.shutdown()
 	}
@@ -113,15 +113,15 @@ func (t *testMQTTExTarget) Shutdown() {
 	}
 }
 
-func testMQTTExMakeServer(tb testing.TB) *testMQTTExTarget {
+func mqttExMakeServer(tb testing.TB) *mqttExTarget {
 	tb.Helper()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(tb, o)
-	all := []testMQTTExDial{testMQTTExNewDialForServer(s, "", "")}
-	return &testMQTTExTarget{
+	all := []mqttExDial{mqttExNewDialForServer(s, "", "")}
+	return &mqttExTarget{
 		servers: []*Server{s},
 		all:     all,
-		configs: []testMQTTExTestConfig{
+		configs: []mqttExTestConfig{
 			{
 				name: "single server",
 				pub:  all,
@@ -131,8 +131,8 @@ func testMQTTExMakeServer(tb testing.TB) *testMQTTExTarget {
 	}
 }
 
-func testMQTTExMakeServerWithLeafnode(hubd, leafd string, connectSystemAccount bool) func(tb testing.TB) *testMQTTExTarget {
-	return func(tb testing.TB) *testMQTTExTarget {
+func mqttExMakeServerWithLeafnode(hubd, leafd string, connectSystemAccount bool) func(tb testing.TB) *mqttExTarget {
+	return func(tb testing.TB) *mqttExTarget {
 		tb.Helper()
 
 		if hubd != "" {
@@ -198,14 +198,14 @@ mqtt {
 			os.Remove(leafConf)
 		})
 
-		both := []testMQTTExDial{
-			testMQTTExNewDialForServer(hubServer, "one", "p"),
-			testMQTTExNewDialForServer(leafServer, "one", "p"),
+		both := []mqttExDial{
+			mqttExNewDialForServer(hubServer, "one", "p"),
+			mqttExNewDialForServer(leafServer, "one", "p"),
 		}
-		return &testMQTTExTarget{
+		return &mqttExTarget{
 			servers: []*Server{hubServer, leafServer},
 			all:     both,
-			configs: []testMQTTExTestConfig{
+			configs: []mqttExTestConfig{
 				{name: "pub to all", pub: both, sub: both},
 				{name: "pub to SPOKE", pub: both[1:], sub: both},
 				{name: "pub to HUB", pub: both[:1], sub: both},
@@ -214,8 +214,8 @@ mqtt {
 	}
 }
 
-func testMQTTExMakeCluster(size int, domain string) func(tb testing.TB) *testMQTTExTarget {
-	return func(tb testing.TB) *testMQTTExTarget {
+func mqttExMakeCluster(size int, domain string) func(tb testing.TB) *mqttExTarget {
+	return func(tb testing.TB) *mqttExTarget {
 		tb.Helper()
 		if size < 3 {
 			tb.Fatal("cluster size must be at least 3")
@@ -253,19 +253,19 @@ func testMQTTExMakeCluster(size int, domain string) func(tb testing.TB) *testMQT
 		cl := createJetStreamClusterWithTemplate(tb, clusterConf, "MQTT", size)
 		cl.waitOnLeader()
 
-		all := []testMQTTExDial{}
+		all := []mqttExDial{}
 		for _, s := range cl.servers {
-			all = append(all, testMQTTExNewDialForServer(s, "one", "p"))
+			all = append(all, mqttExNewDialForServer(s, "one", "p"))
 		}
 
-		return &testMQTTExTarget{
+		return &mqttExTarget{
 			clusters: []*cluster{cl},
 			all:      all,
-			configs: []testMQTTExTestConfig{
+			configs: []mqttExTestConfig{
 				{
 					name: "publish to one",
-					pub: []testMQTTExDial{
-						testMQTTExNewDialForServer(cl.randomServer(), "one", "p"),
+					pub: []mqttExDial{
+						mqttExNewDialForServer(cl.randomServer(), "one", "p"),
 					},
 					sub: all,
 				},
@@ -279,8 +279,8 @@ func testMQTTExMakeCluster(size int, domain string) func(tb testing.TB) *testMQT
 	}
 }
 
-func testMQTTExMakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAccount bool) func(tb testing.TB) *testMQTTExTarget {
-	return func(tb testing.TB) *testMQTTExTarget {
+func mqttExMakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemAccount bool) func(tb testing.TB) *mqttExTarget {
+	return func(tb testing.TB) *mqttExTarget {
 		tb.Helper()
 
 		// Create HUB cluster.
@@ -319,10 +319,10 @@ func testMQTTExMakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemA
 		// Pick a host to connect leafnodes to
 		lno := hub.randomNonLeader().getOpts().LeafNode
 		leafRemoteAddr := fmt.Sprintf("%s:%d", lno.Host, lno.Port)
-		hubRandom := testMQTTExNewDialForServer(hub.randomNonLeader(), "one", "p")
-		hubAll := []testMQTTExDial{}
+		hubRandom := mqttExNewDialForServer(hub.randomNonLeader(), "one", "p")
+		hubAll := []mqttExDial{}
 		for _, s := range hub.servers {
-			hubAll = append(hubAll, testMQTTExNewDialForServer(s, "one", "p"))
+			hubAll = append(hubAll, mqttExNewDialForServer(s, "one", "p"))
 		}
 
 		// Create SPOKE (leafnode) cluster.
@@ -370,23 +370,23 @@ func testMQTTExMakeClusterWithLeafnodeCluster(hubd, leafd string, connectSystemA
 			checkLeafNodeConnectedCount(tb, s, expectedConnections)
 		}
 		spoke.waitOnPeerCount(3)
-		spokeRandom := testMQTTExNewDialForServer(spoke.randomNonLeader(), "one", "p")
-		spokeAll := []testMQTTExDial{}
+		spokeRandom := mqttExNewDialForServer(spoke.randomNonLeader(), "one", "p")
+		spokeAll := []mqttExDial{}
 		for _, s := range spoke.servers {
-			spokeAll = append(spokeAll, testMQTTExNewDialForServer(s, "one", "p"))
+			spokeAll = append(spokeAll, mqttExNewDialForServer(s, "one", "p"))
 		}
 
 		all := append(hubAll, spokeAll...)
 
-		return &testMQTTExTarget{
+		return &mqttExTarget{
 			clusters: []*cluster{hub, spoke},
 			all:      all,
-			configs: []testMQTTExTestConfig{
+			configs: []mqttExTestConfig{
 				{name: "publish to all", pub: all, sub: all},
 				{name: "publish to all hub", pub: hubAll, sub: all},
-				{name: "publish to random in hub", pub: []testMQTTExDial{hubRandom}, sub: all},
+				{name: "publish to random in hub", pub: []mqttExDial{hubRandom}, sub: all},
 				{name: "publish to all spoke", pub: spokeAll, sub: all},
-				{name: "publish to random in spoke", pub: []testMQTTExDial{spokeRandom}, sub: all},
+				{name: "publish to random in spoke", pub: []mqttExDial{spokeRandom}, sub: all},
 			},
 		}
 	}
@@ -405,7 +405,7 @@ var mqttexTestCommandPath = func() string {
 	return p
 }()
 
-func mqttexRunTest(tb testing.TB, subCommand string, dial testMQTTExDial, extraArgs ...string) *MQTTBenchmarkResult {
+func mqttexRunTest(tb testing.TB, subCommand string, dial mqttExDial, extraArgs ...string) *MQTTBenchmarkResult {
 	tb.Helper()
 
 	if mqttexTestCommandPath == "" {

@@ -181,7 +181,7 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 
 func (bc mqttBenchContext) runAndReport(b *testing.B, name string, extraArgs ...string) {
 	b.Helper()
-	r := mqttexRunTest(b, name, testMQTTExNewDial("", "", bc.Host, bc.Port, ""), extraArgs...)
+	r := mqttexRunTest(b, name, mqttExNewDial("", "", bc.Host, bc.Port, ""), extraArgs...)
 	r.report(b)
 }
 
@@ -196,7 +196,7 @@ func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func
 	o = s.getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
-	testMQTTExInitServer(b, testMQTTExNewDial("", "", bc.Host, bc.Port, ""))
+	mqttExInitServer(b, mqttExNewDial("", "", bc.Host, bc.Port, ""))
 	return func() {
 		testMQTTShutdownServer(s)
 		testDisableRMSCache = prevDisableRMSCache
@@ -232,7 +232,7 @@ func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) fun
 	o := cl.randomNonLeader().getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
-	testMQTTExInitServer(b, testMQTTExNewDial("", "", bc.Host, bc.Port, ""))
+	mqttExInitServer(b, mqttExNewDial("", "", bc.Host, bc.Port, ""))
 	return func() {
 		cl.shutdown()
 		testDisableRMSCache = prevDisableRMSCache

@@ -53,35 +53,35 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 	for _, topo := range []struct {
 		name  string
-		makef func(testing.TB) *testMQTTExTarget
+		makef func(testing.TB) *mqttExTarget
 	}{
 		{
 			name:  "single server",
-			makef: testMQTTExMakeServer,
+			makef: mqttExMakeServer,
 		},
 		{
 			name:  "server with leafnode",
-			makef: testMQTTExMakeServerWithLeafnode("HUBD", "LEAFD", true),
+			makef: mqttExMakeServerWithLeafnode("HUBD", "LEAFD", true),
 		},
 		{
 			name:  "server with leafnode no domains",
-			makef: testMQTTExMakeServerWithLeafnode("", "", true),
+			makef: mqttExMakeServerWithLeafnode("", "", true),
 		},
 		{
 			name:  "server with leafnode no system account",
-			makef: testMQTTExMakeServerWithLeafnode("HUBD", "LEAFD", false),
+			makef: mqttExMakeServerWithLeafnode("HUBD", "LEAFD", false),
 		},
 		{
 			name:  "cluster",
-			makef: testMQTTExMakeCluster(4, ""),
+			makef: mqttExMakeCluster(4, ""),
 		},
 		{
 			name:  "cluster with leafnode cluster",
-			makef: testMQTTExMakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
+			makef: mqttExMakeClusterWithLeafnodeCluster("HUBD", "LEAFD", true),
 		},
 		{
 			name:  "cluster with leafnode cluster no system account",
-			makef: testMQTTExMakeClusterWithLeafnodeCluster("HUBD", "LEAFD", false),
+			makef: mqttExMakeClusterWithLeafnodeCluster("HUBD", "LEAFD", false),
 		},
 	} {
 		t.Run(topo.name, func(t *testing.T) {
@@ -90,12 +90,12 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 			// initialize the MQTT assets by "touching" all nodes in the cluster, but then reload to start with fresh server state.
 			for _, dial := range target.all {
-				testMQTTExInitServer(t, dial)
+				mqttExInitServer(t, dial)
 			}
 
 			numRMS := 10
 			strNumRMS := "10"
-			for _, tc := range target.TestConfigs() {
+			for _, tc := range target.configs {
 				t.Run(tc.name, func(t *testing.T) {
 					topic := "subret_" + nuid.Next()
 
