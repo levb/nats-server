@@ -23,11 +23,6 @@ import (
 	"time"
 )
 
-func mqttInitServer(tb testing.TB, server string) {
-	tb.Helper()
-	mqttexRunTest(tb, "pub", []string{server}, "--id", "__init__")
-}
-
 const (
 	KB = 1024
 )
@@ -186,7 +181,7 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 
 func (bc mqttBenchContext) runAndReport(b *testing.B, name string, extraArgs ...string) {
 	b.Helper()
-	r := mqttexRunTest(b, name, []string{fmt.Sprintf("%s:%d", bc.Host, bc.Port)}, extraArgs...)
+	r := mqttexRunTest(b, name, testMQTTExNewDial("", "", bc.Host, bc.Port, ""), extraArgs...)
 	r.report(b)
 }
 
@@ -201,7 +196,7 @@ func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func
 	o = s.getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
-	mqttInitServer(b, fmt.Sprintf("mqtt://%s:%d", bc.Host, bc.Port))
+	testMQTTExInitServer(b, testMQTTExNewDial("", "", bc.Host, bc.Port, ""))
 	return func() {
 		testMQTTShutdownServer(s)
 		testDisableRMSCache = prevDisableRMSCache
@@ -237,7 +232,7 @@ func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) fun
 	o := cl.randomNonLeader().getOpts()
 	bc.Host = o.MQTT.Host
 	bc.Port = o.MQTT.Port
-	mqttInitServer(b, fmt.Sprintf("mqtt://%s:%d", bc.Host, bc.Port))
+	testMQTTExInitServer(b, testMQTTExNewDial("", "", bc.Host, bc.Port, ""))
 	return func() {
 		cl.shutdown()
 		testDisableRMSCache = prevDisableRMSCache
