@@ -40,7 +40,7 @@ and get a detailed understanding before proceeding with this document.
 
 ## Server, client
 
-In the MQTT  specification there are concepts of **Client** and **Server**, used
+In the MQTT specification there are concepts of **Client** and **Server**, used
 somewhat interchangeably with those of **Sender** and **Receiver**. A **Server**
 acts as a **Receiver** when it gets `PUBLISH` messages from a **Sender**
 **Client**, and acts as a **Sender** when it delivers them to subscribed
