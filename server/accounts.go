@@ -96,6 +96,7 @@ type Account struct {
 	nameTag      string
 	lastLimErr   int64
 	routePoolIdx int
+	traceDest    string
 }
 
 const (
@@ -255,11 +256,28 @@ func (a *Account) String() string {
 	return a.Name
 }
 
+func (a *Account) setTraceDest(dest string) {
+	a.mu.Lock()
+	a.traceDest = dest
+	a.mu.Unlock()
+}
+
+func (a *Account) getTraceDest() string {
+	a.mu.RLock()
+	dest := a.traceDest
+	a.mu.RUnlock()
+	return dest
+}
+
 // Used to create shallow copies of accounts for transfer
 // from opts to real accounts in server struct.
+// Account `na` write lock is expected to be held on entry
+// while account `a` is the one from the Options struct
+// being loaded/reloaded and do not need locking.
 func (a *Account) shallowCopy(na *Account) {
 	na.Nkey = a.Nkey
 	na.Issuer = a.Issuer
+	na.traceDest = a.traceDest
 
 	if a.imports.streams != nil {
 		na.imports.streams = make([]*streamImport, 0, len(a.imports.streams))
@@ -2162,9 +2180,15 @@ func shouldSample(l *serviceLatency, c *client) (bool, http.Header) {
 		}
 		return true, http.Header{trcB3: b3} // sampling allowed or left to recipient of header
 	} else if tId := h[trcCtx]; len(tId) != 0 {
+		var sample bool
 		// sample 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 		tk := strings.Split(tId[0], "-")
-		if len(tk) == 4 && len([]byte(tk[3])) == 2 && tk[3] == "01" {
+		if len(tk) == 4 && len([]byte(tk[3])) == 2 {
+			if hexVal, err := strconv.ParseInt(tk[3], 16, 8); err == nil {
+				sample = hexVal&0x1 == 0x1
+			}
+		}
+		if sample {
 			return true, newTraceCtxHeader(h, tId)
 		} else {
 			return false, nil

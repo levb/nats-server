@@ -854,8 +854,12 @@ func (c *client) applyAccountLimits() {
 			}
 		}
 	}
+
+	c.acc.mu.RLock()
 	minLimit(&c.mpay, c.acc.mpay)
 	minLimit(&c.msubs, c.acc.msubs)
+	c.acc.mu.RUnlock()
+
 	s := c.srv
 	opts := s.getOpts()
 	mPay := opts.MaxPayload
@@ -2540,7 +2544,7 @@ func (c *client) processHeaderPub(arg, remaining []byte) error {
 		// trace event with the max payload ingress error.
 		// Do this only for CLIENT connections.
 		if c.kind == CLIENT && len(remaining) > 0 {
-			if td := getHeader(MsgTraceSendTo, remaining); len(td) > 0 {
+			if td := getHeader(MsgTraceDest, remaining); len(td) > 0 {
 				c.initAndSendIngressErrEvent(remaining, string(td), ErrMaxPayload)
 			}
 		}
@@ -4349,11 +4353,11 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 				// We do so by setting the c.pa.trace to nil (it will be restored
 				// with c.pa = pacopy).
 				c.pa.trace = nil
-				// We also need to disable the trace destination header so that
-				// if message is routed, it does not initialize tracing in the
+				// We also need to disable the message trace headers so that
+				// if the message is routed, it does not initialize tracing in the
 				// remote.
-				pos := mt.disableTraceHeader(c, msg)
-				defer mt.enableTraceHeader(c, msg, pos)
+				positions := mt.disableTraceHeaders(c, msg)
+				defer mt.enableTraceHeaders(c, msg, positions)
 			}
 		}
 	}

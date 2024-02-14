@@ -2003,12 +2003,13 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 	// Purge consumers.
 	// Check for filtered purge.
 	if preq != nil && preq.Subject != _EMPTY_ {
-		ss := store.FilteredState(state.FirstSeq, preq.Subject)
+		ss := store.FilteredState(fseq, preq.Subject)
 		fseq = ss.First
 	}
 
 	mset.clsMu.RLock()
 	for _, o := range mset.cList {
+		start := fseq
 		o.mu.RLock()
 		// we update consumer sequences if:
 		// no subject was specified, we can purge all consumers sequences
@@ -2018,10 +2019,15 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 			// or consumer filter subject is subset of purged subject,
 			// but not the other way around.
 			o.isEqualOrSubsetMatch(preq.Subject)
+		// Check if a consumer has a wider subject space then what we purged
+		var isWider bool
+		if !doPurge && preq != nil && o.isFilteredMatch(preq.Subject) {
+			doPurge, isWider = true, true
+			start = state.FirstSeq
+		}
 		o.mu.RUnlock()
 		if doPurge {
-			o.purge(fseq, lseq)
-
+			o.purge(start, lseq, isWider)
 		}
 	}
 	mset.clsMu.RUnlock()
@@ -4214,11 +4220,11 @@ func (mset *stream) processInboundJetStreamMsg(_ *subscription, c *client, _ *Ac
 		msg = copyBytes(msg)
 	}
 	if mt, traceOnly := c.isMsgTraceEnabled(); mt != nil {
-		// If message is delivered, we need to disable the message trace destination
-		// header to prevent a trace event to be generated when a stored message
+		// If message is delivered, we need to disable the message trace headers
+		// to prevent a trace event to be generated when a stored message
 		// is delivered to a consumer and routed.
 		if !traceOnly {
-			mt.disableTraceHeader(c, hdr)
+			mt.disableTraceHeaders(c, hdr)
 		}
 		// This will add the jetstream event while in the client read loop.
 		// Since the event will be updated in a different go routine, the
