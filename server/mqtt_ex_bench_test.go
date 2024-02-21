@@ -54,10 +54,10 @@ var mqttBenchDefaultMatrix = mqttBenchMatrix{
 	Subscribers: []int{1},
 }
 
-type MQTTBenchmarkResult struct {
-	Ops   int                      `json:"ops"`
-	NS    map[string]time.Duration `json:"ns"`
-	Bytes int64                    `json:"bytes"`
+type MQTTBenchmarkResult map[string]*struct {
+	Ops   int           `json:"ops"`
+	NS    time.Duration `json:"ns"`
+	Bytes int64         `json:"bytes"`
 }
 
 func BenchmarkMQTTEx(b *testing.B) {
@@ -170,7 +170,7 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 		m.runMatrix(b, bc, func(b *testing.B, bc *mqttBenchContext) {
 			bc.runAndReport(b, "subret",
 				"--qos", strconv.Itoa(bc.QOS),
-				"--topics", strconv.Itoa(bc.Topics), // number of retained messages
+				"--retained", strconv.Itoa(bc.Topics), // number of retained messages
 				"--subscribers", strconv.Itoa(bc.Subscribers),
 				"--size", strconv.Itoa(bc.MessageSize),
 				"--repeat", strconv.Itoa(b.N), // number of subscribe requests
@@ -181,7 +181,7 @@ func (bc mqttBenchContext) benchmarkSubRet(b *testing.B) {
 
 func (bc mqttBenchContext) runAndReport(b *testing.B, name string, extraArgs ...string) {
 	b.Helper()
-	r := mqttexRunTest(b, name, mqttExNewDial("", "", bc.Host, bc.Port, ""), extraArgs...)
+	r := mqttexRunTest(b, name, []mqttExDial{mqttExNewDial("", "", bc.Host, bc.Port, "")}, extraArgs...)
 	r.report(b)
 }
 
@@ -316,19 +316,19 @@ func sizeKB(size int) string {
 }
 
 func (r MQTTBenchmarkResult) report(b *testing.B) {
+	// To use the github benchmarking action disable SetBytes (the sign gets
+	// misinterpreted), and disable ReportAllocs which causes noise.
+
 	// Disable the default ns metric in favor of custom X_ms/op.
 	b.ReportMetric(0, "ns/op")
+	for unit, v := range r {
+		if v.Bytes > 0 {
+			b.SetBytes(v.Bytes)
+		}
 
-	// Disable MB/s since the github benchmarking action misinterprets the sign
-	// of the result (treats it as less is better).
-	b.SetBytes(0)
-	// b.SetBytes(r.Bytes)
-
-	for unit, ns := range r.NS {
-		nsOp := float64(ns) / float64(r.Ops)
+		nsOp := float64(v.NS) / float64(v.Ops)
 		b.ReportMetric(nsOp/1000000, unit+"_ms/op")
 	}
-	// Diable ReportAllocs() since it confuses the github benchmarking action
-	// with the noise.
-	// b.ReportAllocs()
+
+	b.ReportAllocs()
 }

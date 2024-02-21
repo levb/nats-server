@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nuid"
 )
@@ -118,49 +119,33 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 			strNumRMS := strconv.Itoa(numRMS)
 			topics := make([]string, len(target.configs))
 
+			// Publish and check all sub nodes for retained messages. Store the
+			// topics to check again, after a reboot.
 			for i, tc := range target.configs {
-				// Publish numRMS retained messages one at a time,
-				// round-robin across pub nodes. Remember the topic for each
-				// test config to check the subs after reload.
 				topic := "subret_" + nuid.Next()
 				topics[i] = topic
-				iNode := 0
-				for i := 0; i < numRMS; i++ {
-					pubTopic := fmt.Sprintf("%s/%d", topic, i)
-					dial := tc.pub[iNode%len(tc.pub)]
-					mqttexRunTest(t, "pub", dial,
-						"--retain",
-						"--topic", pubTopic,
-						"--qos", "0",
-						"--size", "128", // message size 128 bytes
-					)
-					iNode++
-				}
-			}
 
-			// Check all sub nodes for retained messages
-			for i, tc := range target.configs {
-				for _, dial := range tc.sub {
-					mqttexRunTest(t, "sub", dial,
-						"--retained", strNumRMS,
-						"--qos", "0",
-						"--topic", topics[i],
-					)
+				args := []string{
+					"--retained", strNumRMS,
+					"--topic", topic,
+					"--size", "1024",
 				}
+				for _, dial := range tc.pub {
+					args = append(args, "--pub-server", string(dial))
+				}
+				mqttexRunTest(t, "subret", tc.sub, args...)
 			}
 
 			// Reload the target
 			target.Reload(t)
 
-			// Now check again
+			// Now check again (explicitly include the subtopics, subret did it implicitly)
 			for i, tc := range target.configs {
-				for _, dial := range tc.sub {
-					mqttexRunTestRetry(t, 1, "sub", dial,
-						"--retained", strNumRMS,
-						"--qos", "0",
-						"--topic", topics[i],
-					)
-				}
+				mqttexRunTestRetry(t, 1, "sub", tc.sub,
+					"--retained", strNumRMS,
+					"--qos", "0",
+					"--topic", topics[i]+"/+",
+				)
 			}
 		})
 	}
@@ -168,7 +153,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 func mqttExInitServer(tb testing.TB, dial mqttExDial) {
 	tb.Helper()
-	mqttexRunTestRetry(tb, 5, "pub", dial)
+	mqttexRunTestRetry(tb, 10, "pub", []mqttExDial{dial}, "--timeout", "2s")
 }
 
 func mqttExNewDialForServer(s *Server, username, password string) mqttExDial {
@@ -225,6 +210,12 @@ func (t *mqttExTarget) Reload(tb testing.TB) {
 	for _, c := range t.clusters {
 		c.stopAll()
 		c.restartAllSamePorts()
+		// We call mqttExInitServer on each server in the reloaded target to make
+		// sure they are ready. Unfortunately it appears that our JS APIs time out
+		// (after 4 seconds) when used immediately after a (cluster) reload. Giving
+		// it a bit of time here seems to reduce the occurence of the timeouts and
+		// thus reduce the overall test time.
+		time.Sleep(1000 * time.Millisecond)
 	}
 
 	for i, s := range t.singleServers {
@@ -539,21 +530,21 @@ var mqttexTestCommandPath = func() string {
 	return p
 }()
 
-func mqttexRunTest(tb testing.TB, subCommand string, dial mqttExDial, extraArgs ...string) *MQTTBenchmarkResult {
+func mqttexRunTest(tb testing.TB, subCommand string, dials []mqttExDial, extraArgs ...string) MQTTBenchmarkResult {
 	tb.Helper()
-	return mqttexRunTestRetry(tb, 1, subCommand, dial, extraArgs...)
+	return mqttexRunTestRetry(tb, 1, subCommand, dials, extraArgs...)
 }
 
-func mqttexRunTestRetry(tb testing.TB, n int, subCommand string, dial mqttExDial, extraArgs ...string) (r *MQTTBenchmarkResult) {
+func mqttexRunTestRetry(tb testing.TB, n int, subCommand string, dials []mqttExDial, extraArgs ...string) MQTTBenchmarkResult {
 	tb.Helper()
 	var err error
 	for i := 0; i < n; i++ {
-		if r, err = mqttexTryTest(tb, subCommand, dial, extraArgs...); err == nil {
+		if r, err := mqttexTryTest(tb, subCommand, dials, extraArgs...); err == nil {
 			return r
 		}
 
 		if i < (n - 1) {
-			tb.Logf("failed to %q %s to %q on attempt %v, will retry.", subCommand, extraArgs, dial.Name(), i)
+			tb.Logf("failed to %q %s on attempt %v, will retry. Error: %v", subCommand, extraArgs, i, err)
 		} else {
 			tb.Fatal(err)
 		}
@@ -561,17 +552,25 @@ func mqttexRunTestRetry(tb testing.TB, n int, subCommand string, dial mqttExDial
 	return nil
 }
 
-func mqttexTryTest(tb testing.TB, subCommand string, dial mqttExDial, extraArgs ...string) (r *MQTTBenchmarkResult, err error) {
+func mqttexTryTest(tb testing.TB, subCommand string, dials []mqttExDial, extraArgs ...string) (MQTTBenchmarkResult, error) {
 	tb.Helper()
+
 	if mqttexTestCommandPath == "" {
 		tb.Skip(`"mqtt-test" command is not found in $PATH.`)
 	}
 
-	args := []string{subCommand, // "-q",
-		"-s", string(dial),
+	args := []string{subCommand} // "-q",
+	for _, dial := range dials {
+		args = append(args, "-s", string(dial))
 	}
 	args = append(args, extraArgs...)
 	cmd := exec.Command(mqttexTestCommandPath, args...)
+	start := time.Now()
+	defer func() {
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			tb.Logf("%q took %v", cmd.String(), elapsed)
+		}
+	}()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -591,8 +590,8 @@ func mqttexTryTest(tb testing.TB, subCommand string, dial mqttExDial, extraArgs 
 		return nil, fmt.Errorf("error executing %q: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
 	}
 
-	r = &MQTTBenchmarkResult{}
-	if err := json.Unmarshal(out, r); err != nil {
+	r := MQTTBenchmarkResult{}
+	if err := json.Unmarshal(out, &r); err != nil {
 		tb.Fatalf("error executing %q: failed to decode output: %v\n\n%s\n\n%s", cmd.String(), err, string(out), errbuf.String())
 	}
 	return r, nil

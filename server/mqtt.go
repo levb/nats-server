@@ -2234,6 +2234,7 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 // with the provided information.
 // Lock not held on entry.
 func (as *mqttAccountSessionManager) handleRetainedMsg(key string, rf *mqttRetainedMsgRef, rm *mqttRetainedMsg, copyBytesToCache bool) {
+
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.retmsgs == nil {
