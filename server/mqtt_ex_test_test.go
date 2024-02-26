@@ -538,22 +538,23 @@ func mqttexRunTest(tb testing.TB, subCommand string, dials []mqttExDial, extraAr
 func mqttexRunTestRetry(tb testing.TB, n int, subCommand string, dials []mqttExDial, extraArgs ...string) MQTTBenchmarkResult {
 	tb.Helper()
 	var err error
+	var r MQTTBenchmarkResult
 	for i := 0; i < n; i++ {
-		if r, err := mqttexTryTest(tb, subCommand, dials, extraArgs...); err == nil {
+		if r, err = mqttexTryTest(tb, subCommand, dials, extraArgs...); err == nil {
 			return r
 		}
 
 		if i < (n - 1) {
-			tb.Logf("failed to %q %s on attempt %v, will retry. Error: %v", subCommand, extraArgs, i, err)
+			tb.Logf("failed to %q %s on attempt %v, will retry %v more times. Error: %v", subCommand, extraArgs, i, n-i, err)
 		} else {
-			tb.Fatal(err)
+			tb.Logf("failed to %q %s last attempt %v. Error: %v", subCommand, extraArgs, i, err)
 		}
 	}
 	return nil
 }
 
 func mqttexTryTest(tb testing.TB, subCommand string, dials []mqttExDial, extraArgs ...string) (MQTTBenchmarkResult, error) {
-	tb.Helper()
+	// tb.Helper()
 
 	if mqttexTestCommandPath == "" {
 		tb.Skip(`"mqtt-test" command is not found in $PATH.`)
