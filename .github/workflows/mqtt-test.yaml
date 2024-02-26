@@ -27,11 +27,11 @@ jobs:
           sudo apt install ./mqtt-cli-4.20.0.deb
           go install github.com/ConnectEverything/mqtt-test@9643d51
 
-      - name: Run tests (3 times to detect flappers)
-        shell: bash --noprofile --norc -eo pipefail {0}
-        run: |
-          cd src/github.com/nats-io/nats-server
-          go test -v --count=1 --run='MQTTEx' ./server
+      # - name: Run tests (3 times to detect flappers)
+      #   shell: bash --noprofile --norc -eo pipefail {0}
+      #   run: |
+      #     cd src/github.com/nats-io/nats-server
+      #     go test -v --count=1 --run='MQTTEx' ./server
 
       - name: Run tests with --race
         shell: bash --noprofile --norc -eo pipefail {0}
@@ -39,10 +39,10 @@ jobs:
           cd src/github.com/nats-io/nats-server
           go test -v --race --failfast --run='MQTTEx' ./server
 
-      - name: Run benchmarks
-        shell: bash --noprofile --norc -eo pipefail {0}
-        run: |
-          cd src/github.com/nats-io/nats-server
-          go test --run='-' --count=3 --bench 'MQTTEx' --benchtime=100x ./server
+      # - name: Run benchmarks
+      #   shell: bash --noprofile --norc -eo pipefail {0}
+      #   run: |
+      #     cd src/github.com/nats-io/nats-server
+      #     go test --run='-' --count=3 --bench 'MQTTEx' --benchtime=100x ./server
 
       # TODO: compare benchmarks
