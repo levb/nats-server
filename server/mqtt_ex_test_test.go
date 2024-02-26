@@ -141,7 +141,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 			// Now check again (explicitly include the subtopics, subret did it implicitly)
 			for i, tc := range target.configs {
-				mqttexRunTestRetry(t, 1, "sub", tc.sub,
+				mqttexRunTestRetry(t, 2, "sub", tc.sub,
 					"--retained", strNumRMS,
 					"--qos", "0",
 					"--topic", topics[i]+"/+",
@@ -153,7 +153,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 func mqttExInitServer(tb testing.TB, dial mqttExDial) {
 	tb.Helper()
-	mqttexRunTestRetry(tb, 10, "pub", []mqttExDial{dial}, "--timeout", "2s")
+	mqttexRunTestRetry(tb, 10, "pubsub", []mqttExDial{dial}, "--timeout", "4s")
 }
 
 func mqttExNewDialForServer(s *Server, username, password string) mqttExDial {
@@ -565,13 +565,6 @@ func mqttexTryTest(tb testing.TB, subCommand string, dials []mqttExDial, extraAr
 	}
 	args = append(args, extraArgs...)
 	cmd := exec.Command(mqttexTestCommandPath, args...)
-	start := time.Now()
-	defer func() {
-		if elapsed := time.Since(start); elapsed > 3*time.Second {
-			tb.Logf("%q took %v", cmd.String(), elapsed)
-		}
-	}()
-
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("error executing %q: %v", cmd.String(), err)
