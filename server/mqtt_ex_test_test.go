@@ -554,13 +554,13 @@ func mqttexRunTestRetry(tb testing.TB, n int, subCommand string, dials []mqttExD
 }
 
 func mqttexTryTest(tb testing.TB, subCommand string, dials []mqttExDial, extraArgs ...string) (MQTTBenchmarkResult, error) {
-	// tb.Helper()
+	tb.Helper()
 
 	if mqttexTestCommandPath == "" {
 		tb.Skip(`"mqtt-test" command is not found in $PATH.`)
 	}
 
-	args := []string{subCommand} // "-q",
+	args := []string{subCommand, "-v"} // "-q",
 	for _, dial := range dials {
 		args = append(args, "-s", string(dial))
 	}
