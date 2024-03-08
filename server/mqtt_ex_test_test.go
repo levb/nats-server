@@ -111,7 +111,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				// TODO (levb): Weird. Without a sleep here, the client
 				// sometimes fails because the server disconnects too early. The
 				// command should've finished by now.
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 				target.Shutdown()
 			})
 
