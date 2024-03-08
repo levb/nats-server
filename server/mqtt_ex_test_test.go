@@ -107,13 +107,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 	} {
 		t.Run(topo.name, func(t *testing.T) {
 			target := topo.makef(t)
-			t.Cleanup(func() {
-				// TODO (levb): Weird. Without a sleep here, the client
-				// sometimes fails because the server disconnects too early. The
-				// command should've finished by now.
-				time.Sleep(50 * time.Millisecond)
-				target.Shutdown()
-			})
+			defer target.Shutdown()
 
 			// initialize the MQTT assets by "touching" all nodes in the
 			// cluster, but then reload to start with fresh server state.
@@ -121,8 +115,8 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				mqttExInitServer(t, dial)
 			}
 
-			numRMS := 32
-			strSize := strconv.Itoa(1024)
+			numRMS := 64
+			strSize := strconv.Itoa(512)
 			strNumRMS := strconv.Itoa(numRMS)
 			topics := make([]string, len(target.configs))
 
@@ -572,7 +566,9 @@ func mqttexTryTest(tb testing.TB, subCommand string, dials []mqttExDial, extraAr
 		tb.Skip(`"mqtt-test" command is not found in $PATH.`)
 	}
 
-	args := []string{subCommand} // "-q",
+	// the "-v" here may be useful in case of errors, but also there appear to
+	// be bugs in the paho client that I couldn't track down.
+	args := []string{subCommand, "-v"}
 	for _, dial := range dials {
 		args = append(args, "-s", string(dial))
 	}
