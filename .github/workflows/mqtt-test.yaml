@@ -31,7 +31,7 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           cd src/github.com/nats-io/nats-server
-          go test -v --run='MQTTEx' ./server
+          go test -v --failfast --count=10 --run='MQTTEx' ./server
 
       - name: Run benchmarks
         shell: bash --noprofile --norc -eo pipefail {0}
