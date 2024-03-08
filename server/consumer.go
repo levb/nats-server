@@ -1822,7 +1822,13 @@ func (acc *Account) checkNewConsumerConfig(cfg, ncfg *ConsumerConfig) error {
 	if cfg.OptStartSeq != ncfg.OptStartSeq {
 		return errors.New("start sequence can not be updated")
 	}
-	if cfg.OptStartTime != ncfg.OptStartTime {
+	if cfg.OptStartTime != nil && ncfg.OptStartTime != nil {
+		// Both have start times set, compare them directly:
+		if !cfg.OptStartTime.Equal(*ncfg.OptStartTime) {
+			return errors.New("start time can not be updated")
+		}
+	} else if cfg.OptStartTime != nil || ncfg.OptStartTime != nil {
+		// At least one start time is set and the other is not
 		return errors.New("start time can not be updated")
 	}
 	if cfg.AckPolicy != ncfg.AckPolicy {
@@ -2333,16 +2339,21 @@ func (o *consumer) checkPendingRequests() {
 // This will release any pending pull requests if applicable.
 // Should be called only by the leader being deleted or stopped.
 // Lock should be held.
-func (o *consumer) releaseAnyPendingRequests() {
+func (o *consumer) releaseAnyPendingRequests(isAssigned bool) {
 	if o.mset == nil || o.outq == nil || o.waiting.len() == 0 {
 		return
 	}
-	hdr := []byte("NATS/1.0 409 Consumer Deleted\r\n\r\n")
+	var hdr []byte
+	if !isAssigned {
+		hdr = []byte("NATS/1.0 409 Consumer Deleted\r\n\r\n")
+	}
 	wq := o.waiting
 	o.waiting = nil
 	for i, rp := 0, wq.rp; i < wq.n; i++ {
 		if wr := wq.reqs[rp]; wr != nil {
-			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+			if hdr != nil {
+				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+			}
 			wr.recycle()
 		}
 		rp = (rp + 1) % cap(wq.reqs)
@@ -5136,27 +5147,52 @@ func (o *consumer) isClosed() bool {
 }
 
 func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
-	o.mu.Lock()
-	js := o.js
+	// If dflag is true determine if we are still assigned.
+	var isAssigned bool
+	if dflag {
+		o.mu.RLock()
+		acc, stream, consumer := o.acc, o.stream, o.name
+		isClustered := o.js != nil && o.js.isClustered()
+		o.mu.RUnlock()
+		if isClustered {
+			// Grab jsa to check assignment.
+			var jsa *jsAccount
+			if acc != nil {
+				// Need lock here to avoid data race.
+				acc.mu.RLock()
+				jsa = acc.js
+				acc.mu.RUnlock()
+			}
+			if jsa != nil {
+				isAssigned = jsa.consumerAssigned(stream, consumer)
+			}
+		}
+	}
 
+	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
 		return nil
 	}
 	o.closed = true
 
-	// Check if we are the leader and are being deleted.
+	// Check if we are the leader and are being deleted (as a node).
 	if dflag && o.isLeader() {
 		// If we are clustered and node leader (probable from above), stepdown.
 		if node := o.node; node != nil && node.Leader() {
 			node.StepDown()
 		}
-		if advisory {
+
+		// dflag does not necessarily mean that the consumer is being deleted,
+		// just that the consumer node is being removed from this peer, so we
+		// send delete advisories only if we are no longer assigned at the meta layer,
+		// or we are not clustered.
+		if !isAssigned && advisory {
 			o.sendDeleteAdvisoryLocked()
 		}
 		if o.isPullMode() {
 			// Release any pending.
-			o.releaseAnyPendingRequests()
+			o.releaseAnyPendingRequests(isAssigned)
 		}
 	}
 
@@ -5206,6 +5242,7 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 		ca = o.ca
 	}
 	sigSubs := o.sigSubs
+	js := o.js
 	o.mu.Unlock()
 
 	if c != nil {

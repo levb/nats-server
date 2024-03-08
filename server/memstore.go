@@ -546,6 +546,54 @@ func (ms *memStore) SubjectsState(subject string) map[string]SimpleState {
 	return fss
 }
 
+func (ms *memStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed int) ([]uint64, error) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+
+	if len(ms.msgs) == 0 {
+		return nil, nil
+	}
+
+	// Implied last sequence.
+	if maxSeq == 0 {
+		maxSeq = ms.state.LastSeq
+	}
+
+	//subs := make(map[string]*SimpleState)
+	seqs := make([]uint64, 0, 64)
+	seen := make(map[uint64]struct{})
+
+	addIfNotDupe := func(seq uint64) {
+		if _, ok := seen[seq]; !ok {
+			seqs = append(seqs, seq)
+			seen[seq] = struct{}{}
+		}
+	}
+
+	for _, filter := range filters {
+		ms.fss.Match(stringToBytes(filter), func(subj []byte, ss *SimpleState) {
+			if ss.Last <= maxSeq {
+				addIfNotDupe(ss.Last)
+			} else if ss.Msgs > 1 {
+				// The last is greater than maxSeq.
+				s := bytesToString(subj)
+				for seq := maxSeq; seq > 0; seq-- {
+					if sm, ok := ms.msgs[seq]; ok && sm.subj == s {
+						addIfNotDupe(seq)
+						break
+					}
+				}
+			}
+		})
+		// If maxAllowed was sepcified check that we will not exceed that.
+		if maxAllowed > 0 && len(seqs) > maxAllowed {
+			return nil, ErrTooManyResults
+		}
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	return seqs, nil
+}
+
 // SubjectsTotal return message totals per subject.
 func (ms *memStore) SubjectsTotals(filterSubject string) map[string]uint64 {
 	ms.mu.RLock()
@@ -644,7 +692,11 @@ func (ms *memStore) resetAgeChk(delta int64) {
 
 	fireIn := ms.cfg.MaxAge
 	if delta > 0 && time.Duration(delta) < fireIn {
-		fireIn = time.Duration(delta)
+		if fireIn = time.Duration(delta); fireIn < time.Second {
+			// Only fire at most once a second.
+			// Excessive firing can effect ingest performance.
+			fireIn = time.Second
+		}
 	}
 	if ms.ageChk != nil {
 		ms.ageChk.Reset(fireIn)
@@ -655,19 +707,21 @@ func (ms *memStore) resetAgeChk(delta int64) {
 
 // Will expire msgs that are too old.
 func (ms *memStore) expireMsgs() {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-
+	ms.mu.RLock()
 	now := time.Now().UnixNano()
 	minAge := now - int64(ms.cfg.MaxAge)
+	ms.mu.RUnlock()
+
 	for {
+		ms.mu.Lock()
 		if sm, ok := ms.msgs[ms.state.FirstSeq]; ok && sm.ts <= minAge {
 			ms.deleteFirstMsgOrPanic()
 			// Recalculate in case we are expiring a bunch.
 			now = time.Now().UnixNano()
 			minAge = now - int64(ms.cfg.MaxAge)
-
+			ms.mu.Unlock()
 		} else {
+			// We will exit here
 			if len(ms.msgs) == 0 {
 				if ms.ageChk != nil {
 					ms.ageChk.Stop()
@@ -686,7 +740,8 @@ func (ms *memStore) expireMsgs() {
 					ms.ageChk = time.AfterFunc(fireIn, ms.expireMsgs)
 				}
 			}
-			return
+			ms.mu.Unlock()
+			break
 		}
 	}
 }

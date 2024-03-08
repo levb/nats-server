@@ -1,4 +1,4 @@
-// Copyright 2019-2023 The NATS Authors
+// Copyright 2019-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -2403,7 +2403,7 @@ func TestJetStreamAckReplyStreamPending(t *testing.T) {
 		Name:      "MY_WQ",
 		Subjects:  []string{"foo.*"},
 		Storage:   MemoryStorage,
-		MaxAge:    250 * time.Millisecond,
+		MaxAge:    1 * time.Second,
 		Retention: WorkQueuePolicy,
 	}
 	fsc := msc
@@ -2498,7 +2498,7 @@ func TestJetStreamAckReplyStreamPending(t *testing.T) {
 			nc.Flush()
 
 			// Wait for expiration to kick in.
-			checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			checkFor(t, 5*time.Second, time.Second, func() error {
 				if state := mset.state(); state.Msgs != 0 {
 					return fmt.Errorf("Stream still has messages")
 				}
@@ -8125,12 +8125,12 @@ func TestJetStreamUpdateStream(t *testing.T) {
 
 			// Now do age.
 			cfg = *c.mconfig
-			cfg.MaxAge = 100 * time.Millisecond
+			cfg.MaxAge = time.Second
 			if err := mset.update(&cfg); err != nil {
 				t.Fatalf("Unexpected error %v", err)
 			}
 			// Just wait a bit for expiration.
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(2 * time.Second)
 			if mset.config().MaxAge != cfg.MaxAge {
 				t.Fatalf("Expected the change to take effect, %d vs %d", mset.config().MaxAge, cfg.MaxAge)
 			}
@@ -22272,6 +22272,127 @@ func TestJetStreamDirectGetBatchMaxBytes(t *testing.T) {
 	sendRequestAndCheck(&JSApiMsgGetRequest{Seq: 1, Batch: 200}, expected+1)
 }
 
+func TestJetStreamMsgGetAsOfTime(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo.*"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	sendRequestAndCheck := func(mreq *JSApiMsgGetRequest, seq uint64, eerr error) {
+		t.Helper()
+		req, _ := json.Marshal(mreq)
+		rep, err := nc.Request(fmt.Sprintf(JSApiMsgGetT, "TEST"), req, time.Second)
+		require_NoError(t, err)
+		var mrep JSApiMsgGetResponse
+		err = json.Unmarshal(rep.Data, &mrep)
+		require_NoError(t, err)
+		if eerr != nil {
+			require_Error(t, mrep.ToError(), eerr)
+			return
+		}
+		require_NoError(t, mrep.ToError())
+		require_Equal(t, seq, mrep.Message.Sequence)
+	}
+	t0 := time.Now()
+
+	// Check for conflicting options.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0, LastFor: "foo.1"}, 0, NewJSBadRequestError())
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0, Seq: 1}, 0, NewJSBadRequestError())
+
+	// Nothing exists yet in the stream.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0}, 0, NewJSNoMessageFoundError())
+
+	_, err = js.Publish("foo.1", nil)
+	require_NoError(t, err)
+
+	// Try again with t0 and now it will find the first message.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0}, 1, nil)
+
+	t1 := time.Now()
+	_, err = js.Publish("foo.2", nil)
+	require_NoError(t, err)
+
+	// At t0, first message will still be returned first.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0}, 1, nil)
+	// Unless we combine with NextFor...
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0, NextFor: "foo.2"}, 2, nil)
+
+	// At t1 (after first message), the second message will be returned.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t1}, 2, nil)
+
+	t2 := time.Now()
+	// t2 is later than the last message so nothing will be found.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t2}, 0, NewJSNoMessageFoundError())
+}
+
+func TestJetStreamMsgDirectGetAsOfTime(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo.*"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	sendRequestAndCheck := func(mreq *JSApiMsgGetRequest, seq uint64, eerr string) {
+		t.Helper()
+		req, _ := json.Marshal(mreq)
+		rep, err := nc.Request(fmt.Sprintf(JSDirectMsgGetT, "TEST"), req, time.Second)
+		require_NoError(t, err)
+		if eerr != "" {
+			require_Equal(t, rep.Header.Get("Description"), eerr)
+			return
+		}
+
+		mseq, err := strconv.ParseUint(rep.Header.Get("Nats-Sequence"), 10, 64)
+		require_NoError(t, err)
+		require_Equal(t, seq, mseq)
+	}
+	t0 := time.Now()
+
+	// Check for conflicting options.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0, LastFor: "foo.1"}, 0, "Bad Request")
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0, Seq: 1}, 0, "Bad Request")
+
+	// Nothing exists yet in the stream.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0}, 0, "Message Not Found")
+
+	_, err = js.Publish("foo.1", nil)
+	require_NoError(t, err)
+
+	// Try again with t0 and now it will find the first message.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0}, 1, "")
+
+	t1 := time.Now()
+	_, err = js.Publish("foo.2", nil)
+	require_NoError(t, err)
+
+	// At t0, first message will still be returned first.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0}, 1, "")
+	// Unless we combine with NextFor..
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t0, NextFor: "foo.2"}, 2, "")
+
+	// At t1 (after first message), the second message will be returned.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t1}, 2, "")
+
+	t2 := time.Now()
+	// t2 is later than the last message so nothing will be found.
+	sendRequestAndCheck(&JSApiMsgGetRequest{StartTime: &t2}, 0, "Message Not Found")
+}
+
 func TestJetStreamConsumerNakThenAckFloorMove(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -22615,6 +22736,51 @@ func TestJetStreamConsumerPauseViaEndpoint(t *testing.T) {
 	})
 }
 
+func TestJetStreamConsumerPauseResumeViaEndpoint(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"TEST"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name: "CONSUMER",
+	})
+	require_NoError(t, err)
+
+	getConsumerInfo := func() ConsumerInfo {
+		var ci ConsumerInfo
+		infoResp, err := nc.Request("$JS.API.CONSUMER.INFO.TEST.CONSUMER", nil, time.Second)
+		require_NoError(t, err)
+		err = json.Unmarshal(infoResp.Data, &ci)
+		require_NoError(t, err)
+		return ci
+	}
+
+	// Ensure we are not paused
+	require_False(t, getConsumerInfo().Paused)
+
+	// Now we'll pause the consumer for 30 seconds.
+	deadline := time.Now().Add(time.Second * 30)
+	require_True(t, jsTestPause_PauseConsumer(t, nc, "TEST", "CONSUMER", deadline).Equal(deadline))
+
+	// Ensure the consumer reflects being paused
+	require_True(t, getConsumerInfo().Paused)
+
+	subj := fmt.Sprintf("$JS.API.CONSUMER.PAUSE.%s.%s", "TEST", "CONSUMER")
+	_, err = nc.Request(subj, nil, time.Second)
+	require_NoError(t, err)
+
+	// Ensure the consumer reflects being resumed
+	require_False(t, getConsumerInfo().Paused)
+}
+
 func TestJetStreamConsumerPauseHeartbeats(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -22739,4 +22905,342 @@ func TestJetStreamConsumerSurvivesRestart(t *testing.T) {
 	timer := consumer.uptmr
 	consumer.mu.RUnlock()
 	require_True(t, timer != nil)
+}
+
+func TestJetStreamDirectGetMulti(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *nats.StreamConfig
+	}{
+		{name: "MemoryStore",
+			cfg: &nats.StreamConfig{
+				Name:        "TEST",
+				Subjects:    []string{"foo.*"},
+				AllowDirect: true,
+				Storage:     nats.MemoryStorage,
+			}},
+		{name: "FileStore",
+			cfg: &nats.StreamConfig{
+				Name:        "TEST",
+				Subjects:    []string{"foo.*"},
+				AllowDirect: true,
+			}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(c.cfg)
+			require_NoError(t, err)
+
+			// Add in messages
+			for i := 0; i < 33; i++ {
+				js.PublishAsync("foo.foo", []byte(fmt.Sprintf("HELLO-%d", i)))
+				js.PublishAsync("foo.bar", []byte(fmt.Sprintf("WORLD-%d", i)))
+				js.PublishAsync("foo.baz", []byte(fmt.Sprintf("AGAIN-%d", i)))
+			}
+			select {
+			case <-js.PublishAsyncComplete():
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Did not receive completion signal")
+			}
+
+			// Direct subjects.
+			sendRequest := func(mreq *JSApiMsgGetRequest) *nats.Subscription {
+				t.Helper()
+				req, _ := json.Marshal(mreq)
+				// We will get multiple responses so can't do normal request.
+				reply := nats.NewInbox()
+				sub, err := nc.SubscribeSync(reply)
+				require_NoError(t, err)
+				err = nc.PublishRequest("$JS.API.DIRECT.GET.TEST", reply, req)
+				require_NoError(t, err)
+				return sub
+			}
+
+			// Subject / Sequence pair
+			type p struct {
+				subj string
+				seq  int
+			}
+			var eob p
+
+			// Multi-Get will have a nil message as the end marker regardless.
+			checkResponses := func(sub *nats.Subscription, numPendingStart int, expected ...p) {
+				t.Helper()
+				defer sub.Unsubscribe()
+				checkSubsPending(t, sub, len(expected))
+				np := numPendingStart
+				for i := 0; i < len(expected); i++ {
+					msg, err := sub.NextMsg(10 * time.Millisecond)
+					require_NoError(t, err)
+					// If expected is _EMPTY_ that signals we expect a EOB marker.
+					if subj := expected[i].subj; subj != _EMPTY_ {
+						// Make sure subject is correct.
+						require_Equal(t, subj, msg.Header.Get(JSSubject))
+						// Make sure sequence is correct.
+						require_Equal(t, strconv.Itoa(expected[i].seq), msg.Header.Get(JSSequence))
+						// Should have Data field non-zero
+						require_True(t, len(msg.Data) > 0)
+						// Check we have NumPending and its correct.
+						require_Equal(t, strconv.Itoa(np), msg.Header.Get(JSNumPending))
+						if np > 0 {
+							np--
+						}
+					} else {
+						// Check for properly formatted EOB marker.
+						// Should have no body.
+						require_Equal(t, len(msg.Data), 0)
+						// We mark status as 204 - No Content
+						require_Equal(t, msg.Header.Get("Status"), "204")
+						// Check description is EOB
+						require_Equal(t, msg.Header.Get("Description"), "EOB")
+						// Check we have NumPending and its correct.
+						require_Equal(t, strconv.Itoa(np), msg.Header.Get(JSNumPending))
+					}
+				}
+			}
+
+			sub := sendRequest(&JSApiMsgGetRequest{MultiLastFor: []string{"foo.*"}})
+			checkResponses(sub, 2, p{"foo.foo", 97}, p{"foo.bar", 98}, p{"foo.baz", 99}, eob)
+			// Check with UpToSeq
+			sub = sendRequest(&JSApiMsgGetRequest{MultiLastFor: []string{"foo.*"}, UpToSeq: 3})
+			checkResponses(sub, 2, p{"foo.foo", 1}, p{"foo.bar", 2}, p{"foo.baz", 3}, eob)
+
+			// Test No Results.
+			sub = sendRequest(&JSApiMsgGetRequest{MultiLastFor: []string{"bar.*"}})
+			checkSubsPending(t, sub, 1)
+			msg, err := sub.NextMsg(10 * time.Millisecond)
+			require_NoError(t, err)
+			// Check for properly formatted No Results.
+			// Should have no body.
+			require_Equal(t, len(msg.Data), 0)
+			// We mark status as 204 - No Content
+			require_Equal(t, msg.Header.Get("Status"), "404")
+			// Check description is No Results
+			require_Equal(t, msg.Header.Get("Description"), "No Results")
+		})
+	}
+}
+
+func TestJetStreamDirectGetMultiUpToTime(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo.*"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	js.Publish("foo.foo", []byte("1"))
+	js.Publish("foo.bar", []byte("1"))
+	js.Publish("foo.baz", []byte("1"))
+	start := time.Now()
+	time.Sleep(time.Second)
+	js.Publish("foo.foo", []byte("2"))
+	js.Publish("foo.bar", []byte("2"))
+	js.Publish("foo.baz", []byte("2"))
+	mid := time.Now()
+	time.Sleep(time.Second)
+	js.Publish("foo.foo", []byte("3"))
+	js.Publish("foo.bar", []byte("3"))
+	js.Publish("foo.baz", []byte("3"))
+	end := time.Now()
+
+	// Direct subjects.
+	sendRequest := func(mreq *JSApiMsgGetRequest) *nats.Subscription {
+		t.Helper()
+		req, _ := json.Marshal(mreq)
+		// We will get multiple responses so can't do normal request.
+		reply := nats.NewInbox()
+		sub, err := nc.SubscribeSync(reply)
+		require_NoError(t, err)
+		err = nc.PublishRequest("$JS.API.DIRECT.GET.TEST", reply, req)
+		require_NoError(t, err)
+		return sub
+	}
+
+	checkResponses := func(sub *nats.Subscription, val string, expected ...string) {
+		t.Helper()
+		defer sub.Unsubscribe()
+		checkSubsPending(t, sub, len(expected))
+		for i := 0; i < len(expected); i++ {
+			msg, err := sub.NextMsg(10 * time.Millisecond)
+			require_NoError(t, err)
+			// If expected is _EMPTY_ that signals we expect a EOB marker.
+			if subj := expected[i]; subj != _EMPTY_ {
+				// Make sure subject is correct.
+				require_Equal(t, subj, msg.Header.Get(JSSubject))
+				// Should have Data field non-zero
+				require_True(t, len(msg.Data) > 0)
+				// Make sure the value matches.
+				require_Equal(t, string(msg.Data), val)
+			}
+		}
+	}
+
+	// Make sure you can't set both.
+	sub := sendRequest(&JSApiMsgGetRequest{Seq: 1, MultiLastFor: []string{"foo.*"}, UpToSeq: 3, UpToTime: &start})
+	checkSubsPending(t, sub, 1)
+	msg, err := sub.NextMsg(10 * time.Millisecond)
+	require_NoError(t, err)
+	// Check for properly formatted No Results.
+	// Should have no body.
+	require_Equal(t, len(msg.Data), 0)
+	// We mark status as 204 - No Content
+	require_Equal(t, msg.Header.Get("Status"), "408")
+	// Check description is No Results
+	require_Equal(t, msg.Header.Get("Description"), "Bad Request")
+
+	// Valid responses.
+	sub = sendRequest(&JSApiMsgGetRequest{Seq: 1, MultiLastFor: []string{"foo.*"}, UpToTime: &start})
+	checkResponses(sub, "1", "foo.foo", "foo.bar", "foo.baz", _EMPTY_)
+
+	sub = sendRequest(&JSApiMsgGetRequest{Seq: 1, MultiLastFor: []string{"foo.*"}, UpToTime: &mid})
+	checkResponses(sub, "2", "foo.foo", "foo.bar", "foo.baz", _EMPTY_)
+
+	sub = sendRequest(&JSApiMsgGetRequest{Seq: 1, MultiLastFor: []string{"foo.*"}, UpToTime: &end})
+	checkResponses(sub, "3", "foo.foo", "foo.bar", "foo.baz", _EMPTY_)
+}
+
+func TestJetStreamDirectGetMultiMaxAllowed(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo.*"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	// from stream.go - const maxAllowedResponses = 1024, so max sure > 1024
+	// Add in messages
+	for i := 1; i <= 1025; i++ {
+		js.PublishAsync(fmt.Sprintf("foo.%d", i), []byte("OK"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	req, _ := json.Marshal(&JSApiMsgGetRequest{Seq: 1, MultiLastFor: []string{"foo.*"}})
+	msg, err := nc.Request("$JS.API.DIRECT.GET.TEST", req, time.Second)
+	require_NoError(t, err)
+
+	// Check for properly formatted Too Many Results error.
+	// Should have no body.
+	require_Equal(t, len(msg.Data), 0)
+	// We mark status as 413 - Too Many Results
+	require_Equal(t, msg.Header.Get("Status"), "413")
+	// Check description is No Results
+	require_Equal(t, msg.Header.Get("Description"), "Too Many Results")
+}
+
+func TestJetStreamDirectGetMultiPaging(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo.*"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	// We will queue up 500 messages, each 512k big and request them for a multi-get.
+	// This will not hit the max allowed limit of 1024, but will bump up against max bytes and only return partial results.
+	// We want to make sure we can pick up where we left off.
+
+	// Add in messages
+	data, sent := bytes.Repeat([]byte("Z"), 512*1024), 500
+	for i := 1; i <= sent; i++ {
+		js.PublishAsync(fmt.Sprintf("foo.%d", i), data)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+	// Wait for all replicas to be correct.
+	time.Sleep(time.Second)
+
+	// Direct subjects.
+	sendRequest := func(mreq *JSApiMsgGetRequest) *nats.Subscription {
+		t.Helper()
+		req, _ := json.Marshal(mreq)
+		// We will get multiple responses so can't do normal request.
+		reply := nats.NewInbox()
+		sub, err := nc.SubscribeSync(reply)
+		require_NoError(t, err)
+		err = nc.PublishRequest("$JS.API.DIRECT.GET.TEST", reply, req)
+		require_NoError(t, err)
+		return sub
+	}
+
+	// Setup variables that control procesPartial
+	start, seq, np, b, bsz := 1, 1, sent-1, 0, 128
+
+	processPartial := func(expected int) {
+		t.Helper()
+		sub := sendRequest(&JSApiMsgGetRequest{Seq: uint64(start), Batch: b, MultiLastFor: []string{"foo.*"}})
+		checkSubsPending(t, sub, expected)
+		// Check partial.
+		// We should receive seqs seq-(seq+bsz-1)
+		for ; seq < start+(expected-1); seq++ {
+			msg, err := sub.NextMsg(10 * time.Millisecond)
+			require_NoError(t, err)
+			// Make sure sequence is correct.
+			require_Equal(t, strconv.Itoa(int(seq)), msg.Header.Get(JSSequence))
+			// Check we have NumPending and its correct.
+			require_Equal(t, strconv.Itoa(int(np)), msg.Header.Get(JSNumPending))
+			if np > 0 {
+				np--
+			}
+		}
+		// Now check EOB
+		msg, err := sub.NextMsg(10 * time.Millisecond)
+		require_NoError(t, err)
+		// We mark status as 204 - No Content
+		require_Equal(t, msg.Header.Get("Status"), "204")
+		// Check description is EOB
+		require_Equal(t, msg.Header.Get("Description"), "EOB")
+		// Check we have NumPending and its correct.
+		require_Equal(t, strconv.Itoa(np), msg.Header.Get(JSNumPending))
+		// Check we have LastSequence and its correct.
+		require_Equal(t, strconv.Itoa(seq-1), msg.Header.Get(JSLastSequence))
+		// Check we have UpToSequence and its correct.
+		require_Equal(t, strconv.Itoa(sent), msg.Header.Get(JSUpToSequence))
+		// Update start
+		start = seq
+	}
+
+	processPartial(bsz + 1) // 128 + EOB
+	processPartial(bsz + 1) // 128 + EOB
+	processPartial(bsz + 1) // 128 + EOB
+	// Last one will be a partial block.
+	processPartial(116 + 1)
+
+	// Now reset and test that batch is honored as well.
+	start, seq, np, b = 1, 1, sent-1, 100
+	for i := 0; i < 5; i++ {
+		processPartial(b + 1) // 100 + EOB
+	}
 }
