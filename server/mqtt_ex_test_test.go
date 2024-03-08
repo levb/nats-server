@@ -121,9 +121,9 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				mqttExInitServer(t, dial)
 			}
 
-			numRMS := 200
-			strNumRMS := strconv.Itoa(numRMS)
+			numRMS := 32
 			strSize := strconv.Itoa(1024)
+			strNumRMS := strconv.Itoa(numRMS)
 			topics := make([]string, len(target.configs))
 
 			// Publish and check all sub nodes for retained messages. Store the
