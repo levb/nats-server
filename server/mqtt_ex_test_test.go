@@ -108,10 +108,10 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 		t.Run(topo.name, func(t *testing.T) {
 			target := topo.makef(t)
 			t.Cleanup(func() {
-				// <>/<> TODO: Weird. Without a sleep here, the client sometimes
-				// fails because the server disconnects too early. The command
-				// should've finished by now.
-				time.Sleep(50 * time.Millisecond)
+				// TODO (levb): Weird. Without a sleep here, the client
+				// sometimes fails because the server disconnects too early. The
+				// command should've finished by now.
+				time.Sleep(10 * time.Millisecond)
 				target.Shutdown()
 			})
 
@@ -121,9 +121,9 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				mqttExInitServer(t, dial)
 			}
 
-			numRMS := 100
+			numRMS := 200
 			strNumRMS := strconv.Itoa(numRMS)
-			strSize := strconv.Itoa(512)
+			strSize := strconv.Itoa(1024)
 			topics := make([]string, len(target.configs))
 
 			// Publish and check all sub nodes for retained messages. Store the
