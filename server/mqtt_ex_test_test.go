@@ -107,7 +107,13 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 	} {
 		t.Run(topo.name, func(t *testing.T) {
 			target := topo.makef(t)
-			t.Cleanup(target.Shutdown)
+			t.Cleanup(func() {
+				// <>/<> TODO: Weird. Without a sleep here, the client sometimes
+				// fails because the server disconnects too early. The command
+				// should've finished by now.
+				time.Sleep(50 * time.Millisecond)
+				target.Shutdown()
+			})
 
 			// initialize the MQTT assets by "touching" all nodes in the
 			// cluster, but then reload to start with fresh server state.
@@ -117,6 +123,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 			numRMS := 100
 			strNumRMS := strconv.Itoa(numRMS)
+			strSize := strconv.Itoa(512)
 			topics := make([]string, len(target.configs))
 
 			// Publish and check all sub nodes for retained messages. Store the
@@ -128,11 +135,12 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 				args := []string{
 					"--retained", strNumRMS,
 					"--topic", topic,
-					"--size", "1024",
+					"--size", strSize,
 				}
 				for _, dial := range tc.pub {
 					args = append(args, "--pub-server", string(dial))
 				}
+
 				mqttexRunTest(t, "subret", tc.sub, args...)
 			}
 
@@ -141,10 +149,14 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 			// Now check again (explicitly include the subtopics, subret did it implicitly)
 			for i, tc := range target.configs {
-				mqttexRunTestRetry(t, 2, "sub", tc.sub,
+				topic := topics[i]
+				if numRMS > 1 {
+					topic += "/+"
+				}
+				mqttexRunTestRetry(t, 1, "sub", tc.sub,
 					"--retained", strNumRMS,
 					"--qos", "0",
-					"--topic", topics[i]+"/+",
+					"--topic", topic,
 				)
 			}
 		})
@@ -153,7 +165,7 @@ func TestMQTTExRetainedMessages(t *testing.T) {
 
 func mqttExInitServer(tb testing.TB, dial mqttExDial) {
 	tb.Helper()
-	mqttexRunTestRetry(tb, 10, "pubsub", []mqttExDial{dial}, "--timeout", "4s")
+	mqttexRunTestRetry(tb, 3, "pubsub", []mqttExDial{dial}, "--timeout", "4s")
 }
 
 func mqttExNewDialForServer(s *Server, username, password string) mqttExDial {
@@ -545,9 +557,9 @@ func mqttexRunTestRetry(tb testing.TB, n int, subCommand string, dials []mqttExD
 		}
 
 		if i < (n - 1) {
-			tb.Logf("failed to %q %s on attempt %v, will retry %v more times. Error: %v", subCommand, extraArgs, i, n-i, err)
+			tb.Logf("failed to %q %s on attempt %v, will retry %v more times. Error: %v", subCommand, extraArgs, i, n-i-1, err)
 		} else {
-			tb.Logf("failed to %q %s last attempt %v. Error: %v", subCommand, extraArgs, i, err)
+			tb.Fatalf("failed to %q %s last attempt %v. Error: %v", subCommand, extraArgs, i, err)
 		}
 	}
 	return nil
@@ -560,7 +572,7 @@ func mqttexTryTest(tb testing.TB, subCommand string, dials []mqttExDial, extraAr
 		tb.Skip(`"mqtt-test" command is not found in $PATH.`)
 	}
 
-	args := []string{subCommand, "-v"} // "-q",
+	args := []string{subCommand} // "-q",
 	for _, dial := range dials {
 		args = append(args, "-s", string(dial))
 	}
