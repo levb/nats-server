@@ -12,7 +12,7 @@ concurrency:
 jobs:
   js-cluster-1:
     name: Lev MQTT test
-    runs-on: ${{ vars.GHA_WORKER_LARGE }}
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
