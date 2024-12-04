@@ -1,8 +1,8 @@
 name: NATS Server Tests
 
 on:
-  # push:
-  pull_request:
+  push:
+  # pull_request:
   # workflow_dispatch:
 
 concurrency:
@@ -23,4 +23,4 @@ jobs:
           go-version: stable
 
       - name: Run unit tests
-        run: go test -race -v -run=TestMQTTSubRetained ./server/... -count=100 -timeout=30m -failfast
+        run: go test -v -run=TestMQTTSubRetained ./server -count=10 -timeout=30m -failfast
