@@ -8595,7 +8595,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 
 	// Check for subject collisions here.
-	if js.subjectsOverlap(acc.Name, cfg.Subjects, osa) {
+	if js.subjectsOverlap(acc.Name, newCfg.Subjects, osa) {
 		resp.Error = NewJSStreamSubjectOverlapError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
@@ -8609,7 +8609,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		(newMaxAckPending > 0 && oldMaxAckPending != newMaxAckPending)
 	if updateLimits {
 		var errorConsumers []string
-		for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, cfg.Name) {
+		for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, newCfg.Name) {
 			if ca.Config == nil {
 				continue
 			}
@@ -8665,7 +8665,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		} else {
 			// Need to release js lock.
 			js.mu.Unlock()
-			if si, err := sysRequest[StreamInfo](s, clusterStreamInfoT, ci.serviceAccount(), cfg.Name); err != nil {
+			if si, err := sysRequest[StreamInfo](s, clusterStreamInfoT, ci.serviceAccount(), newCfg.Name); err != nil {
 				msg = fmt.Sprintf("error retrieving info: %s", err.Error())
 			} else if si != nil {
 				currentCount := 0
@@ -8745,8 +8745,8 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			if !s.allPeersOffline(rg) {
 				// Need to release js lock.
 				js.mu.Unlock()
-				if si, err := sysRequest[StreamInfo](s, clusterStreamInfoT, ci.serviceAccount(), cfg.Name); err != nil {
-					s.Warnf("Did not receive stream info results for '%s > %s' due to: %s", acc, cfg.Name, err)
+				if si, err := sysRequest[StreamInfo](s, clusterStreamInfoT, ci.serviceAccount(), newCfg.Name); err != nil {
+					s.Warnf("Did not receive stream info results for '%s > %s' due to: %s", acc, newCfg.Name, err)
 				} else if si != nil {
 					if cl := si.Cluster; cl != nil && cl.Leader != _EMPTY_ {
 						curLeader = getHash(cl.Leader)
