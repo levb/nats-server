@@ -2550,23 +2550,16 @@ func (js *jetStream) processAddPeer(peer string) {
 			csa := sa.copyGroup()
 			csa.Group.Peers = append(csa.Group.Peers, peer)
 			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
+			consumers, _ := js.remapConsumerAssignments(accName, csa, false)
 			if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
 				return
 			}
 			cc.trackInflightStreamProposal(accName, csa, false)
-			for ca := range js.consumerAssignmentsOrInflightSeq(accName, csa.Config.Name) {
-				if ca.unsupported != nil {
-					continue
+			for _, cca := range consumers {
+				if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err != nil {
+					return
 				}
-				// Ephemerals are R=1, so only auto-remap durables, or R>1.
-				if ca.Config.Durable != _EMPTY_ || len(ca.Group.Peers) > 1 {
-					cca := ca.copyGroup()
-					cca.Group.Peers = csa.Group.Peers
-					if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err != nil {
-						return
-					}
-					cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
-				}
+				cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
 			}
 		}
 	}
