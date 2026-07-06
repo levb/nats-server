@@ -13251,6 +13251,171 @@ func TestJetStreamClusterConsumerScaleOnRetentionChange(t *testing.T) {
 	updateRetentionAndCheck(nats.InterestPolicy, 3)
 }
 
+func TestJetStreamClusterStreamPeerRemoveConsumerRemap(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// An R1 durable, its single peer should be left alone if it's not the peer being removed.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "R1",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  1,
+	})
+	require_NoError(t, err)
+
+	// An R3 durable, it should be remapped along with the stream.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "R3",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// An ephemeral, it should survive as long as its peer is not the one being removed.
+	sub, err := js.SubscribeSync("foo")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	eci, err := sub.ConsumerInfo()
+	require_NoError(t, err)
+	ephemeral, ephemeralPeer := eci.Name, eci.Cluster.Leader
+
+	ci, err := js.ConsumerInfo("TEST", "R1")
+	require_NoError(t, err)
+	require_Len(t, len(ci.Cluster.Replicas), 0)
+	r1Peer := ci.Cluster.Leader
+
+	// Remove a stream peer that hosts neither the R1 durable nor the ephemeral.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	peers := []string{si.Cluster.Leader}
+	for _, r := range si.Cluster.Replicas {
+		peers = append(peers, r.Name)
+	}
+	var toRemove string
+	for _, p := range peers {
+		if p != r1Peer && p != ephemeralPeer {
+			toRemove = p
+			break
+		}
+	}
+	require_NotEqual(t, toRemove, _EMPTY_)
+
+	b, err := json.Marshal(JSApiStreamRemovePeerRequest{Peer: toRemove})
+	require_NoError(t, err)
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), b, time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamRemovePeerResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+	require_True(t, resp.Success)
+
+	// Wait for the stream to be back at R3 with the removed peer replaced.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
+		if err != nil {
+			return err
+		}
+		if si.Cluster == nil || si.Cluster.Leader == _EMPTY_ {
+			return fmt.Errorf("no stream leader yet")
+		}
+		if len(si.Cluster.Replicas) != 2 {
+			return fmt.Errorf("expected 2 replicas, got %d", len(si.Cluster.Replicas))
+		}
+		if si.Cluster.Leader == toRemove {
+			return fmt.Errorf("removed peer still stream leader")
+		}
+		for _, r := range si.Cluster.Replicas {
+			if r.Name == toRemove {
+				return fmt.Errorf("removed peer still in stream peer set")
+			}
+		}
+		return nil
+	})
+
+	// The R3 durable should have been remapped off of the removed peer.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		ci, err := js.ConsumerInfo("TEST", "R3", nats.MaxWait(time.Second))
+		if err != nil {
+			return err
+		}
+		if ci.Cluster == nil || ci.Cluster.Leader == _EMPTY_ {
+			return fmt.Errorf("no consumer leader yet")
+		}
+		if len(ci.Cluster.Replicas) != 2 {
+			return fmt.Errorf("expected 2 replicas, got %d", len(ci.Cluster.Replicas))
+		}
+		if ci.Cluster.Leader == toRemove {
+			return fmt.Errorf("removed peer still consumer leader")
+		}
+		for _, r := range ci.Cluster.Replicas {
+			if r.Name == toRemove {
+				return fmt.Errorf("removed peer still in consumer peer set")
+			}
+		}
+		return nil
+	})
+
+	// The R1 durable was not on the removed peer, it must be left alone and specifically
+	// must NOT be scaled up to the full new stream peer set.
+	ci, err = js.ConsumerInfo("TEST", "R1")
+	require_NoError(t, err)
+	require_Equal(t, ci.Cluster.Leader, r1Peer)
+	require_Len(t, len(ci.Cluster.Replicas), 0)
+
+	// The ephemeral was not on the removed peer either, it should still exist.
+	_, err = js.ConsumerInfo("TEST", ephemeral)
+	require_NoError(t, err)
+}
+
+func TestJetStreamClusterStreamPeerRemoveEphemeralDeleted(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sub, err := js.SubscribeSync("foo")
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	eci, err := sub.ConsumerInfo()
+	require_NoError(t, err)
+	ephemeral, ephemeralPeer := eci.Name, eci.Cluster.Leader
+
+	// Remove the ephemeral's peer from the stream.
+	b, err := json.Marshal(JSApiStreamRemovePeerRequest{Peer: ephemeralPeer})
+	require_NoError(t, err)
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), b, time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamRemovePeerResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+	require_True(t, resp.Success)
+
+	// The ephemeral had its only peer removed, it should be deleted rather than moved.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		_, err := js.ConsumerInfo("TEST", ephemeral, nats.MaxWait(time.Second))
+		if err == nil {
+			return fmt.Errorf("expected ephemeral consumer to be deleted")
+		}
+		require_Error(t, err, NewJSConsumerNotFoundError())
+		return nil
+	})
+}
+
 //
 // DO NOT ADD NEW TESTS IN THIS FILE (unless to balance test times)
 // Add at the end of jetstream_cluster_<n>_test.go, with <n> being the highest value.

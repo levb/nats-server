@@ -2649,30 +2649,23 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	}
 
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
+	consumers, deleted := js.remapConsumerAssignments(accName, csa, true)
 	if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
 		return false
 	}
 	cc.trackInflightStreamProposal(accName, csa, false)
-	rg := csa.Group
-	for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
-		if ca.unsupported != nil {
-			continue
+	for _, cca := range consumers {
+		if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err != nil {
+			return false
 		}
-		// Ephemerals are R=1, so only auto-remap durables, or R>1.
-		if ca.Config.Durable != _EMPTY_ {
-			cca := ca.copyGroup()
-			cca.Group.Peers, cca.Group.Preferred = rg.Peers, _EMPTY_
-			if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err != nil {
-				return false
-			}
-			cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
-		} else if ca.Group.isMember(peer) {
-			// These are ephemerals. Check to see if we deleted this peer.
-			if err := cc.meta.Propose(encodeDeleteConsumerAssignment(ca)); err != nil {
-				return false
-			}
-			cc.trackInflightConsumerProposal(accName, csa.Config.Name, ca, true)
+		cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
+	}
+	// These are ephemerals that had all of their peers removed.
+	for _, ca := range deleted {
+		if err := cc.meta.Propose(encodeDeleteConsumerAssignment(ca)); err != nil {
+			return false
 		}
+		cc.trackInflightConsumerProposal(accName, csa.Config.Name, ca, true)
 	}
 	return replaced
 }
@@ -7782,9 +7775,7 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, removePe
 }
 
 // Lock should be held.
-func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignment) []*consumerAssignment {
-	var consumers []*consumerAssignment
-
+func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignment, remove bool) (consumers, deleted []*consumerAssignment) {
 	rg := sa.Group
 	targetPeers := rg.Peers
 	if len(rg.Peers) > sa.Config.Replicas {
@@ -7814,6 +7805,11 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 			} else {
 				keepOld = append(keepOld, p)
 			}
+		}
+		// If an ephemeral lost all of its peers to removal, we delete it rather than move it.
+		if kept == 0 && remove && !isDurableConsumer(ca.Config) {
+			deleted = append(deleted, ca)
+			continue
 		}
 		// Backfill from the shuffled target set until the consumer has its desired number of target peers.
 		if len(tail) < r {
@@ -7854,7 +7850,8 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 			cca.Config.Replicas = r
 		}
 		// Check if all peers are invalid. This can happen with R1 under replicated streams that are being scaled down.
-		if kept == 0 && !js.srv.allPeersOffline(ca.Group) {
+		// If the old peers are being removed we can't ask them for state, so skip the transfer.
+		if kept == 0 && !remove && !js.srv.allPeersOffline(ca.Group) {
 			// We have to transfer state to new peers.
 			// we will grab our state and attach to the new assignment.
 			// TODO(dlc) - In practice we would want to make sure the consumer is paused.
@@ -7880,7 +7877,7 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 		// We can not propose here before the stream itself so we collect them.
 		consumers = append(consumers, cca)
 	}
-	return consumers
+	return consumers, deleted
 }
 
 type selectPeerError struct {
@@ -8796,7 +8793,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Need to remap any consumers.
 	if isReplicaChange || isMoveRequest || isRetentionChange {
-		consumers = js.remapConsumerAssignments(acc.Name, sa)
+		consumers, _ = js.remapConsumerAssignments(acc.Name, sa, false)
 	}
 
 	if err := meta.Propose(encodeUpdateStreamAssignment(sa)); err != nil {
