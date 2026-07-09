@@ -8792,6 +8792,17 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		consumers, _ = js.remapConsumerAssignments(acc.Name, sa, false)
 	}
 
+	// If this is a pure retention change to a non-limits policy, perform the consumer scaling first.
+	if isRetentionChange && !isReplicaChange && !isMoveRequest && sa.Config.Retention != LimitsPolicy {
+		for _, ca := range consumers {
+			if err := meta.Propose(encodeAddConsumerAssignment(ca)); err != nil {
+				return
+			}
+			cc.trackInflightConsumerProposal(acc.Name, sa.Config.Name, ca, false)
+		}
+		consumers = nil
+	}
+
 	if err := meta.Propose(encodeUpdateStreamAssignment(sa)); err != nil {
 		return
 	}

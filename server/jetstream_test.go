@@ -16367,8 +16367,8 @@ func TestJetStreamLimitsToInterestPolicy(t *testing.T) {
 	defer nc.Close()
 
 	// This is the index of the consumer that we'll create as R1
-	// instead of R3, just to prove that it blocks the stream
-	// update from happening properly.
+	// instead of R3, just to prove that the switch to interest-based
+	// retention also scales it up to an R3 consumer.
 	singleReplica := 3
 
 	streamCfg := nats.StreamConfig{
@@ -16427,40 +16427,25 @@ func TestJetStreamLimitsToInterestPolicy(t *testing.T) {
 		require_Equal(t, info.AckFloor.Consumer, uint64(count))
 	}
 
-	// Try updating to interest-based. This should fail because
-	// we have a consumer that is R1 on an R3 stream.
+	// Try updating to interest-based. Even though we have a consumer
+	// that is R1 on an R3 stream, this should succeed: the consumer
+	// should be scaled up to match the stream instead of the update
+	// being rejected.
 	streamCfg = stream.Config
 	streamCfg.Retention = nats.InterestPolicy
 	_, err = js.UpdateStream(&streamCfg)
-	require_Error(t, err)
-
-	// Now we'll make the R1 consumer an R3.
-	cname := fmt.Sprintf("test_%d", singleReplica)
-	cinfo, err := js.ConsumerInfo("TEST", cname)
 	require_NoError(t, err)
 
-	cinfo.Config.Replicas = streamCfg.Replicas
-	_, _ = js.UpdateConsumer("TEST", &cinfo.Config)
-	// TODO(nat): The jsConsumerCreateRequest update doesn't always
-	// respond when there are no errors updating a consumer, so this
-	// nearly always returns a timeout, despite actually doing what
-	// it should. We'll make sure the replicas were updated by doing
-	// another consumer info just to be sure.
-	// require_NoError(t, err)
+	// We need to wait for all nodes to have applied the new configs.
 	c.waitOnAllCurrent()
+
+	// The previously R1 consumer should now be R3, matching the stream.
+	cname := fmt.Sprintf("test_%d", singleReplica)
 	c.waitOnConsumerLeader(globalAccountName, "TEST", cname)
-	cinfo, err = js.ConsumerInfo("TEST", cname)
+	cinfo, err := js.ConsumerInfo("TEST", cname)
 	require_NoError(t, err)
 	require_Equal(t, cinfo.Config.Replicas, streamCfg.Replicas)
 	require_Equal(t, len(cinfo.Cluster.Replicas), streamCfg.Replicas-1)
-
-	// This time it should succeed.
-	_, err = js.UpdateStream(&streamCfg)
-	require_NoError(t, err)
-
-	// We need to wait for all nodes to have applied the new stream
-	// configuration.
-	c.waitOnAllCurrent()
 
 	// Now we should only have 10 messages left in the stream, as
 	// each consumer has acked at least the first 10 messages.
