@@ -7840,7 +7840,10 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 		}
 		// If the replicas was not 0 make sure it matches here.
 		if cca.Config.Replicas != 0 {
-			cca.Config.Replicas = r
+			// Copy the config before mutating it, since only the assignment was copied.
+			cfg := *cca.Config
+			cfg.Replicas = r
+			cca.Config = &cfg
 		}
 		// Check if all peers are invalid. This can happen with R1 under replicated streams that are being scaled down.
 		// If the old peers are being removed we can't ask them for state, so skip the transfer.
