@@ -2666,17 +2666,6 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 		// a subsequent update to an existing tier will then move from existing past tier to existing new tier
 	}
 
-	if mset.isLeader() && mset.sa != nil && ocfg.Retention != cfg.Retention && cfg.Retention == InterestPolicy {
-		// Before we can update the retention policy for the consumer, we need
-		// the replica count of all consumers to match the stream.
-		for _, c := range mset.sa.consumers {
-			if c.Config.Replicas > 0 && c.Config.Replicas != cfg.Replicas {
-				mset.mu.Unlock()
-				return fmt.Errorf("consumer %q replica count must be %d", c.Name, cfg.Replicas)
-			}
-		}
-	}
-
 	// If atomic publish is disabled, delete any in-progress batches.
 	if !cfg.AllowAtomicPublish {
 		mset.deleteAtomicBatches(false)
@@ -2699,8 +2688,7 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 	mset.cfg = *cfg
 	mset.cfgMu.Unlock()
 
-	// If we're changing retention and haven't errored because of consumer
-	// replicas by now, whip through and update the consumer retention.
+	// If we're changing retention, whip through and update the consumer retention.
 	if ocfg.Retention != cfg.Retention {
 		toUpdate := make([]*consumer, 0, len(mset.consumers))
 		for _, c := range mset.consumers {
