@@ -10856,7 +10856,8 @@ func TestJetStreamClusterApplyDeleteRangeOpIdempotent(t *testing.T) {
 	replay := newCommittedEntry(1, []*Entry{
 		newEntry(EntryNormal, encodeDeleteRange(&DeleteRange{First: 100, Num: 401})),
 	})
-	_, err = sjs.applyStreamEntries(mset, replay, false)
+	batch := &batchApply{}
+	_, err = sjs.applyStreamEntries(mset, replay, false, batch)
 	require_NoError(t, err)
 	require_Equal(t, mset.lastSeq(), 1000)
 
@@ -10870,7 +10871,7 @@ func TestJetStreamClusterApplyDeleteRangeOpIdempotent(t *testing.T) {
 	dr := newCommittedEntry(2, []*Entry{
 		newEntry(EntryNormal, encodeDeleteRange(&DeleteRange{First: 1001, Num: 1000})),
 	})
-	_, err = sjs.applyStreamEntries(mset, dr, false)
+	_, err = sjs.applyStreamEntries(mset, dr, false, batch)
 	require_NoError(t, err)
 	require_Equal(t, mset.lastSeq(), 2000)
 	mset.store.FastState(&after)
@@ -10880,7 +10881,7 @@ func TestJetStreamClusterApplyDeleteRangeOpIdempotent(t *testing.T) {
 	dr = newCommittedEntry(3, []*Entry{
 		newEntry(EntryNormal, encodeDeleteRange(&DeleteRange{First: 1501, Num: 1000})),
 	})
-	_, err = sjs.applyStreamEntries(mset, dr, false)
+	_, err = sjs.applyStreamEntries(mset, dr, false, batch)
 	require_NoError(t, err)
 	require_Equal(t, mset.lastSeq(), 2500)
 	mset.store.FastState(&after)
