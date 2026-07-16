@@ -9901,3 +9901,44 @@ func BenchmarkMQTT_QoS1_PubSub2_256b_Payload(b *testing.B) {
 func BenchmarkMQTT_QoS1_PubSub2___1K_Payload(b *testing.B) {
 	mqttBenchPubQoS1(b, mqttPubSubj, sizedString(1024), 2)
 }
+
+// A PUBREL arriving on a different connection than its PUBLISH (session
+// resumed after a reconnect) has no staged in-memory copy and must fall
+// back to loading the message from JetStream, still delivering it exactly
+// once and completing the exchange.
+func TestMQTTQoS2PubRelResumedSessionDelivery(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	// Publish QoS2 and PUBREC it, then drop before the PUBREL.
+	const pubPI = 7
+	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
+	mcp, mpr := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pubPI, []byte("m"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pubPI)
+	testMQTTDisconnect(t, mcp, nil)
+	mcp.Close()
+	testMQTTExpectNothing(t, msr)
+
+	// Resume the session; the PUBREL now delivers the message, at the sub's QoS.
+	mcp2, mpr2 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcp2.Close()
+	testMQTTCheckConnAck(t, mpr2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pubPI)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pubPI)
+	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("m"))
+	testMQTTExpectNothing(t, msr)
+
+	// A repeated PUBREL is acked without redelivering.
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pubPI)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pubPI)
+	testMQTTExpectNothing(t, msr)
+}

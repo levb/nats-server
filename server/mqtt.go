@@ -4080,14 +4080,16 @@ func (s *Server) mqttHandleWill(c *client) {
 		c.mu.Unlock()
 		return
 	}
-	pp := c.mqtt.pp
-	pp.topic = will.topic
-	pp.subject = will.subject
-	pp.mapped = will.mapped
-	pp.msg = will.message
-	pp.sz = len(will.message)
-	pp.pi = 0
-	pp.flags = will.qos << 1
+	// Create a synthetic PUBLISH packet to be delivered to the session's
+	// subscriptions, regardless of what is currently in c.mqtt.pp.
+	pp := &mqttPublish{
+		topic:   will.topic,
+		subject: will.subject,
+		mapped:  will.mapped,
+		msg:     will.message,
+		sz:      len(will.message),
+		flags:   will.qos << 1,
+	}
 	if will.retain {
 		pp.flags |= mqttPubFlagRetain
 	}
@@ -4360,7 +4362,11 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false)
 
-	// Set the client's pubarg for processing.
+	// The delivery callbacks read this message's context off the client, so
+	// point c.mqtt.pp and c.pa at it (not the last parsed packet, which for
+	// a PUBREL differs).
+	savedPP := c.mqtt.pp
+	c.mqtt.pp = pp
 	c.pa.subject = pp.subject
 	c.pa.mapped = pp.mapped
 	c.pa.reply = nil
@@ -4369,6 +4375,7 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 	c.pa.size = len(natsMsg)
 	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
 	defer func() {
+		c.mqtt.pp = savedPP
 		c.pa.subject = nil
 		c.pa.mapped = nil
 		c.pa.reply = nil
