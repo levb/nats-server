@@ -246,6 +246,9 @@ var (
 	errMQTTInvalidRetainedMessage     = errors.New("invalid retained message")
 	errMQTTSessionCollision           = errors.New("stored session does not match client ID")
 	errMQTTInvalidPublishLength       = errors.New("invalid publish message, variable header exceeds remaining length")
+	errMQTTAckPipelineStopped         = errors.New("ack pipeline has shut down while admitting a packet, " +
+		"abandoning the wait for its JetStream ack; failing the connection, " +
+		"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect")
 )
 
 type srvMQTT struct {
@@ -4632,22 +4635,13 @@ func (pipe *mqttAckPipeline) shutdown() {
 // closes the connection. Runs in its own goroutine, one per connection
 // with inbound QoS1/2 traffic.
 func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
+	// Reset per entry; as of Go 1.23 Stop/Reset guarantee no stale receive,
+	// no draining needed.
 	t := time.NewTimer(time.Hour)
-	stopTimer := func() {
-		if !t.Stop() {
-			select {
-			case <-t.C:
-			default:
-			}
-		}
-	}
-	stopTimer()
-	defer stopTimer()
+	defer t.Stop()
 
 	fail := func(ack *mqttPipelinedAck, err error) {
 		jsa.replies.Delete(ack.reply)
-		// Unblocks a readLoop waiting for room; shutdown drains the queue.
-		pipe.stop()
 		c.Errorf("unable to store QoS1/2 message in JetStream (pi=%v): %v; "+
 			"closing the connection, the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect",
 			ack.pi, err)
@@ -4660,7 +4654,6 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 			t.Reset(jsa.timeout)
 			select {
 			case err := <-ack.done:
-				stopTimer()
 				if err = ack.exceptDuplicateError(err); err != nil {
 					fail(ack, err)
 					return
@@ -4675,14 +4668,14 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 				return
 
 			case <-pipe.quitCh:
-				stopTimer()
-				// Already dequeued, invisible to the exit-path drain.
+				// pipe.shutdown only covers entries still queued; this one is
+				// ours to clean up.
 				jsa.replies.Delete(ack.reply)
 				return
 
 			case <-s.quitCh:
-				stopTimer()
-				// Already dequeued, invisible to the exit-path drain.
+				// pipe.shutdown only covers entries still queued; this one is
+				// ours to clean up.
 				jsa.replies.Delete(ack.reply)
 				return
 			}
@@ -4726,7 +4719,11 @@ func (s *Server) mqttPipelineStart(c *client, jsa *mqttJSA) *mqttAckPipeline {
 	}
 	if !s.startGoRoutine(func() {
 		defer s.grWG.Done()
+
 		s.mqttAckLoop(c, pipe, jsa)
+		// The loop was the sole consumer; release a readLoop possibly
+		// waiting for room in push, it observes only pipe.quitCh.
+		pipe.stop()
 	}) {
 		return nil
 	}
@@ -4757,38 +4754,67 @@ func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, ack *mqttPipelinedAck
 				return fmt.Errorf("JetStream did not acknowledge the QoS1/2 message within %v "+
 					"(server is shutting down); failing the connection, "+
 					"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect", jsa.timeout)
+			case <-s.quitCh:
+				// The reply may never come; do not hold up the shutdown.
+				jsa.replies.Delete(ack.reply)
+				return ErrServerNotRunning
 			}
 		}
 		c.mqtt.acks = pipe
 	}
 
-	// A just-stopped pipeline may admit an unconsumed entry; the
-	// connection-close handler (mqttHandleClosedClient) drains the queue
-	// via pipe.shutdown().
+	return pipe.push(ack)
+}
+
+// Admits an entry into the pipeline. Rejects it once the pipeline is
+// stopped: an entry admitted after the connection-close drain
+// (mqttHandleClosedClient -> pipe.shutdown) would strand its reply
+// registration in the account-scoped jsa.replies. readLoop only.
+func (pipe *mqttAckPipeline) push(ack *mqttPipelinedAck) error {
+	jsa := pipe.jsa
 	select {
-	case pipe.q <- ack:
-		return nil
+	case <-pipe.quitCh:
+		jsa.replies.Delete(ack.reply)
+		return errMQTTAckPipelineStopped
 	default:
 	}
 
-	// Window full: wait for an available slot in the pipeline.
-	t := time.NewTimer(jsa.timeout)
-	defer t.Stop()
+	enqueued := false
 	select {
 	case pipe.q <- ack:
-		return nil
-	case <-pipe.quitCh:
-		jsa.replies.Delete(ack.reply)
-		return errors.New("ack pipeline has shut down while admitting a packet, " +
-			"abandoning the wait for its JetStream ack; failing the connection, " +
-			"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect")
-	case <-t.C:
-		jsa.replies.Delete(ack.reply)
-		return fmt.Errorf("in-flight window is full (%d packets) and JetStream has not acknowledged "+
-			"the oldest one within %v; failing the connection, "+
-			"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect",
-			mqttMaxAcksInFlight, jsa.timeout)
+		enqueued = true
+	default:
+		// Window full: wait for an available slot in the pipeline.
+		t := time.NewTimer(jsa.timeout)
+		defer t.Stop()
+		select {
+		case pipe.q <- ack:
+			enqueued = true
+		case <-pipe.quitCh:
+		case <-t.C:
+			jsa.replies.Delete(ack.reply)
+			return fmt.Errorf("in-flight window is full (%d packets) and JetStream has not acknowledged "+
+				"the oldest one within %v; failing the connection, "+
+				"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect",
+				mqttMaxAcksInFlight, jsa.timeout)
+		}
 	}
+	if !enqueued {
+		// Stopped while waiting for a slot, never admitted.
+		jsa.replies.Delete(ack.reply)
+		return errMQTTAckPipelineStopped
+	}
+
+	// A stop may have raced the enqueue: the close-time drain could run
+	// before the entry landed and miss it. Drain again; both drains only
+	// dequeue and delete, so overlapping is harmless.
+	select {
+	case <-pipe.quitCh:
+		pipe.shutdown()
+		return errMQTTAckPipelineStopped
+	default:
+	}
+	return nil
 }
 
 // Broadcasts an inbound MQTT message into NATS, delivering it to the
@@ -4843,8 +4869,7 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 
 	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
 	// JetStream under "$MQTT.msgs.<delivery-subject>"
-	qos := mqttGetQoS(pp.flags)
-	if qos == 0 {
+	if qos := mqttGetQoS(pp.flags); qos == 0 {
 		return nil
 	}
 

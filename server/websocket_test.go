@@ -23,7 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -1178,7 +1178,7 @@ func TestWSCheckOrigin(t *testing.T) {
 		{"same origin bad scheme explicit port", sameOrigin, allowedListEmpty, "host.com:443", true, "http://host.com:443", "not same origin"},
 		{"same origin bad scheme", sameOrigin, allowedListEmpty, "host.com", true, "http://host.com", "not same origin"},
 		{"same origin bad uri", sameOrigin, allowedListEmpty, "host.com", false, "@@@://invalid:url:1234", "invalid URI"},
-		{"same origin bad url", sameOrigin, allowedListEmpty, "host.com", false, "http://invalid:url:1234", "too many colons"},
+		{"same origin bad url", sameOrigin, allowedListEmpty, "host.com", false, "http://invalid:url:1234", "invalid port"},
 		{"same origin bad req host", sameOrigin, allowedListEmpty, "invalid:url:1234", false, "http://host.com", "too many colons"},
 		{"no origin same origin ignored", sameOrigin, allowedListEmpty, "", false, "", ""},
 		{"no origin list ignored", sameOrigin, someList, "", false, "", ""},
@@ -2193,8 +2193,15 @@ func testWSCreateClient(t testing.TB, compress, web bool, host string, port int)
 		t.Fatalf("Error sending message: %v", err)
 	}
 	// Wait for the PONG
-	if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
+	msg := testWSReadFrame(t, br)
+	if !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
 		t.Fatalf("Expected PONG, got %s", msg)
+	}
+	// An async INFO is sent that's not always part of the same frame. Consume it here.
+	if !bytes.Contains(msg, []byte("INFO ")) {
+		if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("INFO ")) {
+			t.Fatalf("Expected INFO, got %s", msg)
+		}
 	}
 	return wsc, br
 }
@@ -3473,7 +3480,7 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 
 			uncompressedPayload := make([]byte, 2*wsFrameSizeForBrowsers)
 			for i := 0; i < len(uncompressedPayload); i++ {
-				uncompressedPayload[i] = byte(rand.Intn(256))
+				uncompressedPayload[i] = byte(rand.IntN(256))
 			}
 
 			c.mu.Lock()
@@ -4625,7 +4632,7 @@ type partialWriteConn struct {
 func (c *partialWriteConn) Write(b []byte) (int, error) {
 	max := len(b)
 	if max > 0 {
-		max = rand.Intn(max)
+		max = rand.IntN(max)
 		if max == 0 {
 			max = 1
 		}
@@ -4669,7 +4676,7 @@ func TestWSWithPartialWrite(t *testing.T) {
 
 	var msgs [][]byte
 	for i := 0; i < 100; i++ {
-		msg := make([]byte, rand.Intn(10000)+10)
+		msg := make([]byte, rand.IntN(10000)+10)
 		for j := 0; j < len(msg); j++ {
 			msg[j] = byte('A' + j%26)
 		}
@@ -4972,7 +4979,7 @@ var ch = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!
 func sizedString(sz int) string {
 	b := make([]byte, sz)
 	for i := range b {
-		b[i] = ch[rand.Intn(len(ch))]
+		b[i] = ch[rand.IntN(len(ch))]
 	}
 	return string(b)
 }
@@ -4983,7 +4990,7 @@ func sizedStringForCompression(sz int) string {
 	s := 0
 	for i := range b {
 		if s%20 == 0 {
-			c = ch[rand.Intn(len(ch))]
+			c = ch[rand.IntN(len(ch))]
 		}
 		b[i] = c
 	}
@@ -5387,7 +5394,7 @@ func TestWSCompressedFragmentsDoNotShareNbPoolBuffer(t *testing.T) {
 	// Random data does not compress, so the compressed output stays larger than
 	// the browser frame-size limit and is split into multiple frames.
 	uncompressed := make([]byte, 4*wsFrameSizeForBrowsers)
-	n, err := io.ReadFull(rand.New(rand.NewSource(12345)), uncompressed)
+	n, err := io.ReadFull(rand.NewChaCha8([32]byte{42}), uncompressed)
 	require_NoError(t, err)
 	require_Equal(t, n, len(uncompressed))
 

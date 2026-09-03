@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -411,7 +411,7 @@ func TestMonitorHandleVarz(t *testing.T) {
 			t.Fatalf("JS limits not set")
 		}
 		if v.JetStream.Limits.MaxHAAssets != 1000 {
-			t.Fatalf("Expected 1000 max_ha_assets got %q", v.JetStream.Limits.MaxHAAssets)
+			t.Fatalf("Expected 1000 max_ha_assets got %v", v.JetStream.Limits.MaxHAAssets)
 		}
 	}
 }
@@ -1205,14 +1205,12 @@ func TestMonitorConnzSortedByStopTimeClosedConn(t *testing.T) {
 	checkClosedConns(t, s, 4, time.Second)
 
 	// Now adjust the Stop times for these with some random values.
-	s.mu.Lock()
 	now := time.Now().UTC()
 	ccs := s.closed.closedClients()
 	for _, cc := range ccs {
 		newStop := now.Add(time.Duration(rand.Int()%120) * -time.Minute)
 		cc.Stop = &newStop
 	}
-	s.mu.Unlock()
 
 	url = fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	for mode := 0; mode < 2; mode++ {
@@ -1250,13 +1248,11 @@ func TestMonitorConnzSortedByReason(t *testing.T) {
 	checkClosedConns(t, s, 20, time.Second)
 
 	// Now adjust the Reasons for these with some random values.
-	s.mu.Lock()
 	ccs := s.closed.closedClients()
 	max := int(ServerShutdown)
 	for _, cc := range ccs {
 		cc.Reason = ClosedState(rand.Int() % max).String()
 	}
-	s.mu.Unlock()
 
 	url = fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	for mode := 0; mode < 2; mode++ {
@@ -5620,29 +5616,20 @@ func TestMonitorJsz(t *testing.T) {
 		}
 	})
 	t.Run("cluster-info", func(t *testing.T) {
-		found := 0
-		for i, url := range []string{monUrl1, monUrl2} {
+		for _, url := range []string{monUrl1, monUrl2} {
 			info := readJsInfo(url + "")
 			if info.Meta.Peer != getHash(info.Meta.Leader) {
 				t.Fatalf("Invalid Peer: %+v", info.Meta)
 			}
-			if info.Meta.Replicas != nil {
-				found++
-				for _, r := range info.Meta.Replicas {
-					if r.Peer == _EMPTY_ {
-						t.Fatalf("Replicas' Peer is empty: %+v", r)
-					}
-				}
-				if info.Meta.Leader != srvs[i].Name() {
-					t.Fatalf("received cluster info from non leader: leader %s, server: %s", info.Meta.Leader, srvs[i].Name())
+			// Replicas are populated on every server, not just the meta leader.
+			if len(info.Meta.Replicas) == 0 {
+				t.Fatalf("Expected replicas to be populated: %+v", info.Meta)
+			}
+			for _, r := range info.Meta.Replicas {
+				if r.Peer == _EMPTY_ {
+					t.Fatalf("Replicas' Peer is empty: %+v", r)
 				}
 			}
-		}
-		if found == 0 {
-			t.Fatalf("did not receive cluster info from any node")
-		}
-		if found > 1 {
-			t.Fatalf("received cluster info from multiple nodes")
 		}
 	})
 	t.Run("meta-snapshot-stats", func(t *testing.T) {
@@ -7017,9 +7004,7 @@ func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
 	cc.Cid = 1
 	cc.subs = []SubDetail{{Subject: "foo.bar"}}
 	cc.NumSubs = 1
-	s.mu.Lock()
 	s.closed.append(cc)
-	s.mu.Unlock()
 
 	// Concurrently request closed connections with subscription detail.
 	var wg sync.WaitGroup

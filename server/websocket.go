@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -656,7 +656,7 @@ func wsFillFrameHeader(fh []byte, useMasking, first, final, compressed bool, fra
 	if useMasking {
 		var keyBuf [4]byte
 		if _, err := io.ReadFull(crand.Reader, keyBuf[:4]); err != nil {
-			kv := mrand.Int31()
+			kv := mrand.Int32()
 			binary.LittleEndian.PutUint32(keyBuf[:4], uint32(kv))
 		}
 		copy(fh[n:], keyBuf[:4])
@@ -1509,7 +1509,8 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 		if mfs > 0 && c.ws.nocompfrag {
 			mfs = 0
 		}
-		buf := bytes.NewBuffer(nbPoolGet(usz))
+		seed := nbPoolGet(usz)
+		buf := bytes.NewBuffer(seed)
 		cp := c.ws.compressor
 		if cp == nil {
 			c.ws.compressor, _ = flate.NewWriter(buf, flate.BestSpeed)
@@ -1539,9 +1540,15 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 			c.Errorf("Error during compression: %v", err)
 			c.markConnAsClosed(WriteError)
 			cp.Reset(nil)
+			nbPoolPut(seed)
 			return nil, 0
 		}
+
+		// Recycle seed buffer already if capacity changed.
 		b := buf.Bytes()
+		if cap(b) > cap(seed) {
+			nbPoolPut(seed)
+		}
 		p := b[:len(b)-4]
 		if mfs > 0 && len(p) > mfs {
 			for first, final := true, false; len(p) > 0; first = false {

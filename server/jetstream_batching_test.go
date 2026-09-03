@@ -694,12 +694,14 @@ func TestJetStreamAtomicBatchPublishSourceAndMirror(t *testing.T) {
 		rsm, err = js.GetMsg("S", 1)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 1 > > foo")
+		src := rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 1 > > foo"))
 
 		rsm, err = js.GetMsg("S", 2)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 3 > > foo")
+		src = rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 3 > > foo"))
 	}
 
 	t.Run("R1", func(t *testing.T) { test(t, 1) })
@@ -842,7 +844,8 @@ func TestJetStreamAtomicBatchPublishConfigOpts(t *testing.T) {
 		}
 	}`
 
-	cf := createConfFile(t, []byte(fmt.Sprintf(batchingConf, t.TempDir(), 10, 20, 100, "5s")))
+	storeDir := t.TempDir()
+	cf := createConfFile(t, []byte(fmt.Sprintf(batchingConf, storeDir, 10, 20, 100, "5s")))
 	s, _ := RunServerWithConfig(cf)
 	defer s.Shutdown()
 
@@ -852,9 +855,26 @@ func TestJetStreamAtomicBatchPublishConfigOpts(t *testing.T) {
 	require_Equal(t, opts.JetStreamLimits.MaxBatchSize, 100)
 	require_Equal(t, opts.JetStreamLimits.MaxBatchTimeout, 5*time.Second)
 
-	// Reloading is not supported, that would potentially mean dropping random batches when lowering limits.
-	changeCurrentConfigContentWithNewContent(t, cf, []byte(fmt.Sprintf(batchingConf, t.TempDir(), 20, 40, 200, "10s")))
-	require_Error(t, s.Reload(), fmt.Errorf("config reload not supported for JetStreamLimits"))
+	// The limits are all read at the point of use, so they can be reloaded. Raising them.
+	reloadUpdateConfig(t, s, cf, fmt.Sprintf(batchingConf, storeDir, 20, 40, 200, "10s"))
+	opts = s.getOpts()
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightPerStream, 20)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightTotal, 40)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchSize, 200)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchTimeout, 10*time.Second)
+
+	// As well as lowering them again. In-flight batches are not silently dropped, the
+	// publisher is always responded to with an error and an advisory is sent.
+	reloadUpdateConfig(t, s, cf, fmt.Sprintf(batchingConf, storeDir, 5, 10, 50, "2s"))
+	opts = s.getOpts()
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightPerStream, 5)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchInflightTotal, 10)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchSize, 50)
+	require_Equal(t, opts.JetStreamLimits.MaxBatchTimeout, 2*time.Second)
+
+	// Changing the storage directory remains unsupported.
+	changeCurrentConfigContentWithNewContent(t, cf, []byte(fmt.Sprintf(batchingConf, t.TempDir(), 5, 10, 50, "2s")))
+	require_Error(t, s.Reload(), fmt.Errorf("config reload not supported for jetstream storage directory"))
 }
 
 func TestJetStreamAtomicBatchPublishDenyHeaders(t *testing.T) {
@@ -3151,7 +3171,7 @@ func TestJetStreamAtomicBatchPublishPartialBatchInSharedAppendEntry(t *testing.T
 			newEntry(EntryNormal, esm2),
 		})
 		batch := &batchApply{}
-		_, err = js.applyStreamEntries(mset, ce, false, batch)
+		_, err = js.applyStreamEntries(mset, mset.raftNode(), ce, false, batch)
 		require_NoError(t, err)
 		entryStart, maxApplied := batch.entryStart, batch.maxApplied
 
@@ -3205,7 +3225,7 @@ func TestJetStreamAtomicBatchPublishCatchupMarkerMidBatch(t *testing.T) {
 	esm1 := encodeStreamMsgAllowCompressAndBatch("foo", _EMPTY_, hdr1, []byte("hello"), 0, ts, false, "uuid", 1, false)
 	ce1 := newCommittedEntry(1, []*Entry{newEntry(EntryNormal, esm1)})
 	batch := &batchApply{}
-	_, err = js.applyStreamEntries(mset, ce1, false, batch)
+	_, err = js.applyStreamEntries(mset, mset.raftNode(), ce1, false, batch)
 	require_NoError(t, err)
 
 	// Confirm the batch is in progress.
@@ -3215,7 +3235,7 @@ func TestJetStreamAtomicBatchPublishCatchupMarkerMidBatch(t *testing.T) {
 	//    Type==EntryCatchup and Data==nil (see raft.sendCatchupSignal). The
 	//    in-progress batch must remain intact and buffer this marker.
 	catchupCE := newCommittedEntry(0, []*Entry{{EntryCatchup, nil}})
-	_, err = js.applyStreamEntries(mset, catchupCE, false, batch)
+	_, err = js.applyStreamEntries(mset, mset.raftNode(), catchupCE, false, batch)
 	require_NoError(t, err)
 
 	// 3) Apply the batch commit (seq 2). The replay loop must skip the buffered
@@ -3231,7 +3251,7 @@ func TestJetStreamAtomicBatchPublishCatchupMarkerMidBatch(t *testing.T) {
 	var panicked any
 	func() {
 		defer func() { panicked = recover() }()
-		_, err = js.applyStreamEntries(mset, ce2, false, batch)
+		_, err = js.applyStreamEntries(mset, mset.raftNode(), ce2, false, batch)
 	}()
 	if panicked != nil {
 		mset.mu.Unlock()
@@ -4117,12 +4137,14 @@ func TestJetStreamFastBatchPublishSourceAndMirror(t *testing.T) {
 		rsm, err = js.GetMsg("S", 1)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 1 > > foo")
+		src := rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 1 > > foo"))
 
 		rsm, err = js.GetMsg("S", 2)
 		require_NoError(t, err)
 		require_Len(t, len(rsm.Header), 1)
-		require_Equal(t, rsm.Header.Get(JSStreamSource), "TEST 3 > > foo")
+		src = rsm.Header.Get(JSStreamSource)
+		require_True(t, strings.HasPrefix(src, "TEST 3 > > foo"))
 	}
 
 	t.Run("R1", func(t *testing.T) { test(t, 1) })

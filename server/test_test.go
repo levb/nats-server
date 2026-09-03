@@ -16,7 +16,7 @@ package server
 import (
 	"cmp"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"reflect"
@@ -96,7 +96,7 @@ func require_NotNil[T any](t testing.TB, vs ...T) {
 	for _, v := range vs {
 		r := reflect.ValueOf(v)
 		switch k := r.Kind(); k {
-		case reflect.Ptr, reflect.Interface, reflect.Slice,
+		case reflect.Pointer, reflect.Interface, reflect.Slice,
 			reflect.Map, reflect.Chan, reflect.Func:
 			if r.IsNil() {
 				antithesis.AssertUnreachable(t, "Failed require_NotNil check", nil)

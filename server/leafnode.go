@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -589,18 +589,30 @@ func (cfg *leafNodeCfg) setConnectDelay(delay time.Duration) {
 	cfg.Unlock()
 }
 
+// leafNodeDialer establishes the TCP connection to a remote leafnode server.
+// It has the same signature as natsDialTimeout(), which is what is used in
+// production. Tests can substitute their own implementation via
+// LeafNodeOpts.dialer in order to observe the resolved dial timeout, or to
+// simulate a slow/unreachable remote, without needing to manipulate the
+// network stack.
+type leafNodeDialer func(network, address string, timeout time.Duration) (net.Conn, error)
+
 // Ensure that non-exported options (used in tests) have
 // been properly set.
 func (s *Server) setLeafNodeNonExportedOptions() {
 	opts := s.getOpts()
-	s.leafNodeOpts.dialTimeout = opts.LeafNode.dialTimeout
-	if s.leafNodeOpts.dialTimeout == 0 {
+	s.leafNodeOpts.dialTimeout = opts.LeafNode.DialTimeout
+	if s.leafNodeOpts.dialTimeout <= 0 {
 		// Use same timeouts as routes for now.
 		s.leafNodeOpts.dialTimeout = DEFAULT_ROUTE_DIAL
 	}
 	s.leafNodeOpts.resolver = opts.LeafNode.resolver
 	if s.leafNodeOpts.resolver == nil {
 		s.leafNodeOpts.resolver = net.DefaultResolver
+	}
+	s.leafNodeOpts.dialer = opts.LeafNode.dialer
+	if s.leafNodeOpts.dialer == nil {
+		s.leafNodeOpts.dialer = natsDialTimeout
 	}
 }
 
@@ -710,6 +722,7 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 	s.mu.RLock()
 	dialTimeout := s.leafNodeOpts.dialTimeout
 	resolver := s.leafNodeOpts.resolver
+	dialer := s.leafNodeOpts.dialer
 	var isSysAcc bool
 	if s.eventsEnabled() {
 		isSysAcc = remote.LocalAccount == s.sys.account.Name
@@ -744,6 +757,12 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 	proxyUsername := remote.Proxy.Username
 	proxyPassword := remote.Proxy.Password
 	proxyTimeout := remote.Proxy.Timeout
+	// A remote can override the server-wide dial timeout. This is useful on
+	// high latency links where the default is too short for the TCP handshake
+	// to complete.
+	if remote.DialTimeout > 0 {
+		dialTimeout = remote.DialTimeout
+	}
 	remote.RUnlock()
 
 	// Set default proxy timeout if not specified
@@ -794,12 +813,12 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 					conn, err = establishHTTPProxyTunnel(proxyURL, targetHost, proxyTimeout, proxyUsername, proxyPassword)
 				} else {
 					// Direct connection
-					conn, err = natsDialTimeout("tcp", url, dialTimeout)
+					conn, err = dialer("tcp", url, dialTimeout)
 				}
 			}
 		}
 		if err != nil {
-			jitter := time.Duration(rand.Int63n(int64(reconnectDelay)))
+			jitter := time.Duration(rand.Int64N(int64(reconnectDelay)))
 			delay := reconnectDelay + jitter
 			attempts++
 			if s.shouldReportConnectErr(firstConnect, attempts) {
@@ -1653,6 +1672,12 @@ func (c *client) processLeafnodeInfo(info *Info) {
 			c.closeConnection(ProtocolViolation)
 			return
 		}
+		if info.Cluster == leafNoOriginCluster {
+			c.mu.Unlock()
+			c.sendErrAndErr(ErrClusterNameReserved.Error())
+			c.closeConnection(ProtocolViolation)
+			return
+		}
 		// For solicited outbound leaf connections, capture the remote's nonce.
 		// For inbound leaf connections, keep using the server-issued nonce that
 		// was sent in our initial INFO and must be signed in CONNECT.
@@ -2091,13 +2116,16 @@ func (s *Server) addLeafNodeConnection(c *client, srvName, clusterName string, c
 		c.mergeDenyPermissionsLocked(both, denyAllClientJs)
 	}
 	// If we have a specified JetStream domain we will want to add a mapping to
-	// allow access cross domain for each non-system account.
-	if opts.JetStreamDomain != _EMPTY_ && opts.JetStream && acc != nil && acc != sysAcc {
-		for src, dest := range generateJSMappingTable(opts.JetStreamDomain) {
-			if err := acc.AddMapping(src, dest); err != nil {
-				c.Debugf("Error adding JetStream domain mapping: %s", err.Error())
-			} else {
-				c.Debugf("Adding JetStream Domain Mapping %q -> %s to account %q", src, dest, accName)
+	// allow access cross domain for each non-system account. The system account
+	// is mapped in setupJetStreamExports, it only needs the outgoing block here.
+	if opts.JetStreamDomain != _EMPTY_ && opts.JetStream && acc != nil {
+		if acc != sysAcc {
+			for src, dest := range generateJSMappingTable(opts.JetStreamDomain) {
+				if err := acc.AddMapping(src, dest); err != nil {
+					c.Debugf("Error adding JetStream domain mapping: %s", err.Error())
+				} else {
+					c.Debugf("Adding JetStream Domain Mapping %q -> %s to account %q", src, dest, accName)
+				}
 			}
 		}
 		if blockMappingOutgoing {
@@ -2211,6 +2239,11 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 		c.sendErrAndErr(ErrClusterNameHasSpaces.Error())
 		c.closeConnection(ProtocolViolation)
 		return ErrClusterNameHasSpaces
+	}
+	if proto.Cluster == leafNoOriginCluster {
+		c.sendErrAndErr(ErrClusterNameReserved.Error())
+		c.closeConnection(ProtocolViolation)
+		return ErrClusterNameReserved
 	}
 
 	// Check for cluster name collisions.
@@ -2516,7 +2549,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 			continue
 		}
 		// Don't advertise interest from leafnodes to other isolated leafnodes.
-		if sub.client.kind == LEAF && c.isIsolatedLeafNode() {
+		if (sub.client.kind == LEAF || sub.leaf) && c.isIsolatedLeafNode() {
 			continue
 		}
 		// We ignore ourselves here.
@@ -2640,7 +2673,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 	nleafs := len(acc.lleafs)
 	start := 0
 	if nleafs > 1 {
-		start = rand.Intn(nleafs)
+		start = rand.IntN(nleafs)
 	}
 	for i := 0; i < nleafs; i++ {
 		ln := acc.lleafs[(start+i)%nleafs]
@@ -2649,7 +2682,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 		}
 		ln.mu.RLock()
 		// Don't advertise interest from leafnodes to other isolated leafnodes.
-		if sub.client.kind == LEAF && ln.isIsolatedLeafNode() {
+		if (sub.client.kind == LEAF || sub.leaf) && ln.isIsolatedLeafNode() {
 			ln.mu.RUnlock()
 			continue
 		}
@@ -2818,10 +2851,12 @@ func keyFromSub(sub *subscription) string {
 }
 
 const (
-	keyRoutedSub         = "R"
-	keyRoutedSubByte     = 'R'
-	keyRoutedLeafSub     = "L"
-	keyRoutedLeafSubByte = 'L'
+	keyRoutedSub                 = "R"
+	keyRoutedSubByte             = 'R'
+	keyRoutedLeafSub             = "L"
+	keyRoutedLeafSubByte         = 'L'
+	keyRoutedLeafNoOriginSub     = "N"
+	keyRoutedLeafNoOriginSubByte = 'N'
 )
 
 // Helper function to build the key that prevents collisions between normal
@@ -2829,14 +2864,18 @@ const (
 // Keys will look like this:
 // "R foo"          -> plain routed sub on "foo"
 // "R foo bar"      -> queue routed sub on "foo", queue "bar"
+// "N foo"          -> plain routed leaf sub on "foo" without an origin
+// "N foo bar"      -> queue routed leaf sub on "foo", queue "bar", without an origin
 // "L foo bar"      -> plain routed leaf sub on "foo", leaf "bar"
 // "L foo bar baz"  -> queue routed sub on "foo", queue "bar", leaf "baz"
 func keyFromSubWithOrigin(sub *subscription) string {
 	var sb strings.Builder
 	sb.Grow(2 + len(sub.origin) + 1 + len(sub.subject) + 1 + len(sub.queue))
-	leaf := len(sub.origin) > 0
-	if leaf {
+	hasOrigin := len(sub.origin) > 0
+	if hasOrigin {
 		sb.WriteByte(keyRoutedLeafSubByte)
+	} else if sub.leaf {
+		sb.WriteByte(keyRoutedLeafNoOriginSubByte)
 	} else {
 		sb.WriteByte(keyRoutedSubByte)
 	}
@@ -2846,7 +2885,7 @@ func keyFromSubWithOrigin(sub *subscription) string {
 		sb.WriteByte(' ')
 		sb.Write(sub.queue)
 	}
-	if leaf {
+	if hasOrigin {
 		sb.WriteByte(' ')
 		sb.Write(sub.origin)
 	}
@@ -2901,7 +2940,7 @@ func (c *client) processLeafSub(argo []byte) (err error) {
 	copy(arg, argo)
 
 	args := splitArg(arg)
-	sub := &subscription{client: c}
+	sub := &subscription{client: c, leaf: true}
 
 	delta := int32(1)
 	switch len(args) {
