@@ -6398,7 +6398,7 @@ func TestMQTTQoS2RejectPublishDuplicatesAcrossReconnect(t *testing.T) {
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: qos2}}, []byte{qos2})
 
-	// Stage a message, then lose the connection as if the PUBREC never made
+	// Get a copy held, then lose the connection as if the PUBREC never made
 	// it back to the client.
 	cipub := &mqttConnInfo{clientID: "pub", cleanSess: false}
 	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
@@ -10576,7 +10576,7 @@ func TestMQTTQoS2AckPipelineConnClose(t *testing.T) {
 		testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
 	}
 	// inMsgs counts broadcasts, and a QoS2 PUBLISH does not broadcast (it
-	// only stages) - the PUBREL-initiated deliveries do. The PUBRELs were
+	// only holds) - the PUBREL-initiated deliveries do. The PUBRELs were
 	// written after all the PUBLISHes on the same connection, so all of
 	// them delivered implies every packet above was processed.
 	pc := testMQTTGetClient(t, s, "pub")
@@ -10621,18 +10621,18 @@ func TestMQTTQoS2AckPipelineConnClose(t *testing.T) {
 	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("fresh"))
 }
 
-// A corrupt staged message (no Nmqtt-Pub header) must fail the connection
+// A corrupt held message (no Nmqtt-Pub header) must fail the connection
 // on PUBREL - never be acknowledged or delivered - but also be discarded,
 // so the PUBREL the client retries on its next connection converges to a
 // clean PUBCOMP instead of re-loading the same message every time.
-func TestMQTTQoS2PubRelInvalidStagedMessage(t *testing.T) {
+func TestMQTTQoS2PubRelInvalidHeldMessage(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	const cid = "corrupt"
 	const pi = uint16(5)
-	stagedSubject := fmt.Sprintf("%s%s.%d", mqttQoS2IncomingMsgsStreamSubjectPrefix, cid, pi)
+	heldSubject := fmt.Sprintf("%s%s.%d", mqttQoS2IncomingMsgsStreamSubjectPrefix, cid, pi)
 
 	// Wildcard interest to verify the corrupt message is never delivered.
 	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
@@ -10648,7 +10648,7 @@ func TestMQTTQoS2PubRelInvalidStagedMessage(t *testing.T) {
 	defer mc.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
-	// Plant a message with no MQTT headers where the staged copy for pi
+	// Plant a message with no MQTT headers where the held copy for pi
 	// would live.
 	// The $-prefixed inbox keeps this connection's JS API replies out of
 	// the MQTT '#' subscription: wildcards must not match $-topics.
@@ -10658,8 +10658,8 @@ func TestMQTTQoS2PubRelInvalidStagedMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to get JetStream: %v", err)
 	}
-	if _, err := js.Publish(stagedSubject, []byte("garbage")); err != nil {
-		t.Fatalf("Error planting the corrupt staged message: %v", err)
+	if _, err := js.Publish(heldSubject, []byte("garbage")); err != nil {
+		t.Fatalf("Error planting the corrupt held message: %v", err)
 	}
 
 	// PUBREL for it: no in-memory copy, the load finds the corrupt message,
@@ -10669,14 +10669,14 @@ func TestMQTTQoS2PubRelInvalidStagedMessage(t *testing.T) {
 
 	// The corrupt message is discarded (asynchronously), and not delivered.
 	checkFor(t, 2*time.Second, 25*time.Millisecond, func() error {
-		_, err := js.GetLastMsg(mqttQoS2IncomingMsgsStreamName, stagedSubject)
+		_, err := js.GetLastMsg(mqttQoS2IncomingMsgsStreamName, heldSubject)
 		switch {
 		case err == nil:
-			return fmt.Errorf("corrupt staged message still present")
+			return fmt.Errorf("corrupt held message still present")
 		case errors.Is(err, nats.ErrMsgNotFound):
 			return nil
 		default:
-			t.Fatalf("Unexpected error checking the staged subject: %v", err)
+			t.Fatalf("Unexpected error checking the held-copy subject: %v", err)
 			return nil
 		}
 	})
@@ -10695,7 +10695,7 @@ func TestMQTTQoS2PubRelInvalidStagedMessage(t *testing.T) {
 // Reusing a packet identifier for a new publication after its previous
 // exchange was released must deliver every message exactly once: the
 // released mark of the old exchange must not short-circuit the new one,
-// and the new message must not dedupe against the old exchange's staged
+// and the new message must not dedupe against the old exchange's held
 // copy, whose asynchronous discard may still be in flight.
 func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 	o := testMQTTDefaultOptions()
@@ -10714,7 +10714,7 @@ func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 
 	// Full compliant exchanges back-to-back on the same PI: each PUBCOMP
 	// legally releases the PI for the next publication, typically while
-	// the previous staged copy's discard is still in flight.
+	// the previous held copy's discard is still in flight.
 	const pi = uint16(1)
 	const cycles = 10
 	for i := 1; i <= cycles; i++ {
@@ -10732,7 +10732,7 @@ func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-func testMQTTQoS2StagedCount(t *testing.T, s *Server) uint64 {
+func testMQTTQoS2HeldCount(t *testing.T, s *Server) uint64 {
 	t.Helper()
 	acc, err := s.lookupAccount(globalAccountName)
 	if err != nil {
@@ -10746,7 +10746,7 @@ func testMQTTQoS2StagedCount(t *testing.T, s *Server) uint64 {
 }
 
 // The invariant items 1+2 of the correctness plan buy: a PUBCOMP the
-// client receives proves the staged copy was durably discarded, so a
+// client receives proves the held copy was durably discarded, so a
 // PUBREL retransmitted on a later connection (a lost PUBCOMP, from the
 // client's point of view) finds nothing to load and cannot deliver a
 // duplicate. The stream is checked immediately after each PUBCOMP - no
@@ -10772,8 +10772,8 @@ func TestMQTTQoS2PubCompImpliesDiscard(t *testing.T) {
 		testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
 		testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
 		testMQTTReadPIPacket(mqttPacketPubComp, t, mpr, pi)
-		if n := testMQTTQoS2StagedCount(t, s); n != 0 {
-			t.Fatalf("pi %v: PUBCOMP received but %v staged message(s) remain", pi, n)
+		if n := testMQTTQoS2HeldCount(t, s); n != 0 {
+			t.Fatalf("pi %v: PUBCOMP received but %v held message(s) remain", pi, n)
 		}
 	}
 
@@ -10794,7 +10794,7 @@ func TestMQTTQoS2PubCompImpliesDiscard(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// A PUBREL for an exchange staged by a previous connection: the released
+// A PUBREL for an exchange held by a previous connection: the released
 // mark died with that connection, so the delivery comes from the
 // JetStream fallback load - the only dup-candidate path - and its
 // discard uses the sequence the load returned. The retransmitted PUBREL
@@ -10810,7 +10810,7 @@ func TestMQTTQoS2FallbackLoadDelivery(t *testing.T) {
 	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
 	testMQTTFlush(t, mcs, nil, msr)
 
-	// Stage the message and read the PUBREC, then drop the connection
+	// Get the message held and read the PUBREC, then drop the connection
 	// before the PUBREL.
 	const pi = uint16(5)
 	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
@@ -10828,8 +10828,8 @@ func TestMQTTQoS2FallbackLoadDelivery(t *testing.T) {
 	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("m"))
 	// The PUBCOMP was gated on the seq-addressed discard of the loaded
 	// copy.
-	if n := testMQTTQoS2StagedCount(t, s); n != 0 {
-		t.Fatalf("PUBCOMP received but %v staged message(s) remain", n)
+	if n := testMQTTQoS2HeldCount(t, s); n != 0 {
+		t.Fatalf("PUBCOMP received but %v held message(s) remain", n)
 	}
 
 	// A retransmitted PUBREL on this connection is screened by the
