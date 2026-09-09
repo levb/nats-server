@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -2039,7 +2039,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	cs.Shutdown()
 
 	// Specifically for route test, wait at least reconnect interval before checking logs
-	time.Sleep(DEFAULT_ROUTE_RECONNECT)
+	time.Sleep(routeReconnectDelay)
 
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()

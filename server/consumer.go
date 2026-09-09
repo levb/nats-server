@@ -1160,11 +1160,14 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 		// than stream config we prefer the account limits to handle cases where account limits are
 		// updated during the lifecycle of the stream
 		maxc := cfg.MaxConsumers
-		if maxConsumers := srvLim.DefaultMaxConsumers; maxConsumers > 0 && maxc <= 0 {
-			maxc = maxConsumers
-		}
 		if maxc <= 0 || (selectedLimits.MaxConsumers > 0 && selectedLimits.MaxConsumers < maxc) {
 			maxc = selectedLimits.MaxConsumers
+		}
+		// Only apply default limits if the user specified neither stream nor account limit.
+		// An unlimited (-1) stream or account limit counts as not set, since that is also
+		// the default for accounts, so the default can't be opted out of per stream or account.
+		if maxConsumers := srvLim.DefaultMaxConsumers; maxConsumers > 0 && maxc <= 0 {
+			maxc = maxConsumers
 		}
 		if maxc > 0 && mset.numLimitableConsumers() >= maxc {
 			mset.mu.Unlock()
@@ -2246,6 +2249,17 @@ func (o *consumer) deleteNotActive() {
 		}
 	} else {
 		// Pull mode.
+		// Check if we still have valid requests waiting. This also expires
+		// requests, which updates the last activity, so must be checked first.
+		if o.checkWaitingForInterest() {
+			if o.dtmr != nil {
+				o.dtmr.Reset(o.dthresh)
+			} else {
+				o.dtmr = time.AfterFunc(o.dthresh, o.deleteNotActive)
+			}
+			o.mu.Unlock()
+			return
+		}
 		elapsed := time.Since(o.waiting.last)
 		if elapsed < o.dthresh {
 			// These need to keep firing so reset but use delta.
@@ -2253,16 +2267,6 @@ func (o *consumer) deleteNotActive() {
 				o.dtmr.Reset(o.dthresh - elapsed)
 			} else {
 				o.dtmr = time.AfterFunc(o.dthresh-elapsed, o.deleteNotActive)
-			}
-			o.mu.Unlock()
-			return
-		}
-		// Check if we still have valid requests waiting.
-		if o.checkWaitingForInterest() {
-			if o.dtmr != nil {
-				o.dtmr.Reset(o.dthresh)
-			} else {
-				o.dtmr = time.AfterFunc(o.dthresh, o.deleteNotActive)
 			}
 			o.mu.Unlock()
 			return
@@ -4534,6 +4538,10 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 			}
+			// Expiring a request counts as activity for the inactive threshold.
+			if wr.expires.After(o.waiting.last) {
+				o.waiting.last = wr.expires
+			}
 			o.waiting.removeCurrent()
 			if o.node != nil {
 				o.removeClusterPendingRequest(wr.reply)
@@ -4929,6 +4937,22 @@ func (o *consumer) isEqualOrSubsetMatch(subj string) bool {
 	return false
 }
 
+// Check if all consumer filter subjects are subsets of the candidate subject.
+// Lock should be held.
+func (o *consumer) isFilterSubsetOf(subj string) bool {
+	if len(o.subjf) == 0 {
+		return false
+	}
+	tsa := [32]string{}
+	tts := tokenizeSubjectIntoSlice(tsa[:0], subj)
+	for _, filter := range o.subjf {
+		if !isSubsetMatchTokenized(filter.tokenizedSubject, tts) {
+			return false
+		}
+	}
+	return true
+}
+
 var (
 	errMaxAckPending = errors.New("max ack pending reached")
 	errBadConsumer   = errors.New("consumer not valid")
@@ -5095,6 +5119,9 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 			if expires {
 				hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+				if wr.expires.After(wq.last) {
+					wq.last = wr.expires
+				}
 				wr = remove(pre, wr)
 				continue
 			} else if wr.expires.IsZero() || wr.d > 0 {
@@ -5102,6 +5129,9 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 				// Return no messages instead, which is the same as if we'd rejected the pull request initially.
 				hdr := fmt.Appendf(nil, "NATS/1.0 404 No Messages\r\n\r\n")
 				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+				if now.After(wq.last) {
+					wq.last = now
+				}
 				wr = remove(pre, wr)
 				continue
 			}

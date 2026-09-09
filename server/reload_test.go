@@ -1,4 +1,4 @@
-// Copyright 2017-2025 The NATS Authors
+// Copyright 2017-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -1858,7 +1858,7 @@ func TestConfigReloadClusterRemoveSolicitedRoutes(t *testing.T) {
 
 	// We should not have a cluster formed here.
 	numRoutes := 0
-	deadline := time.Now().Add(2 * DEFAULT_ROUTE_RECONNECT)
+	deadline := time.Now().Add(routeReconnectDelay + 500*time.Millisecond)
 	for time.Now().Before(deadline) {
 		if numRoutes = srva.NumRoutes(); numRoutes != 0 {
 			break

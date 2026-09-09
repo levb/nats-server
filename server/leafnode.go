@@ -310,13 +310,6 @@ func validateLeafNode(o *Options) error {
 				return fmt.Errorf("remote leaf node configuration cannot have a mix of websocket and non-websocket urls: %q", redactURLList(rcfg.URLs))
 			}
 		}
-		if !wsAllowedFIPS() {
-			for _, u := range rcfg.URLs {
-				if isWSURL(u) {
-					return fmt.Errorf("remote leaf node URL %q cannot be used in FIPS-140 mode when built with this Go version, use Go 1.26 or later", redactURLString(u.String()))
-				}
-			}
-		}
 		// Validate compression settings
 		if rcfg.Compression.Mode != _EMPTY_ {
 			if err := validateAndNormalizeCompressionOption(&rcfg.Compression, CompressionS2Auto); err != nil {
@@ -1049,7 +1042,9 @@ func (s *Server) startLeafNodeAcceptLoop() {
 		s.mu.Unlock()
 		return
 	}
-	s.leafURLsMap[s.leafNodeInfo.IP]++
+	if !opts.LeafNode.NoAdvertise {
+		s.leafURLsMap[s.leafNodeInfo.IP]++
+	}
 	s.generateLeafNodeInfoJSON()
 
 	// Setup state that can enable shutdown
@@ -1581,7 +1576,7 @@ func (c *client) processLeafnodeInfo(info *Info) {
 	if firstINFO && !c.flags.isSet(compressionNegotiated) {
 		// A solicited leafnode connection must first receive a leafnode INFO.
 		// Classify wrong-port connections before any leaf-specific negotiation.
-		if didSolicit && (info.CID == 0 || info.LeafNodeURLs == nil) {
+		if didSolicit && (info.CID == 0 || (info.LeafNodeURLs == nil && !info.InfoOnConnect)) {
 			c.mu.Unlock()
 			c.Errorf(ErrConnectedToWrongPort.Error())
 			c.closeConnection(WrongPort)

@@ -1,4 +1,4 @@
-// Copyright 2016-2025 The NATS Authors
+// Copyright 2016-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -723,6 +723,15 @@ func TestValidateDestinationSubject(t *testing.T) {
 	checkError(ValidateMapping("*", "foo.{{partition(2,1)}}"), nil, t)
 	checkError(ValidateMapping("*.*", "foo.{{SplitFromLeft(2,1)}}"), nil, t)
 	checkError(ValidateMapping("*.*", "foo.{{SplitFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{SliceFromLeft(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{SliceFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{split(1,-)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{random(1)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{left(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{Left(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{right(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{Right(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{ left( 1 , 2 ) }}"), nil, t)
 	checkError(ValidateMapping("*", "foo.{{unknown(1)}}"), ErrInvalidMappingDestination, t)
 	checkError(ValidateMapping("foo", "foo..}"), ErrInvalidMappingDestination, t)
 	checkError(ValidateMapping("foo", "foo. bar}"), ErrInvalidMappingDestinationSubject, t)

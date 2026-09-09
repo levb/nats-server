@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -2760,6 +2760,47 @@ func TestAccountBasicRouteMapping(t *testing.T) {
 
 	checkPending(fsub, 1)
 	checkPending(bsub, 1)
+}
+
+func TestAccountLeftRightMapping(t *testing.T) {
+	// left and right are supported by the subject transform since 2.10.16,
+	// so account mappings must accept them like the other functions.
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			A {
+				users = [{user: a, password: p}]
+				mappings = {
+					"foo.*": "bar.{{right(1,2)}}"
+					"baz.*": "qux.{{left(1,3)}}"
+				}
+			}
+		}
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("a", "p"))
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync("bar.>")
+	require_NoError(t, err)
+	sub2, err := nc.SubscribeSync("qux.>")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	require_NoError(t, nc.Publish("foo.1234", nil))
+	require_NoError(t, nc.Publish("baz.1234", nil))
+	require_NoError(t, nc.Flush())
+
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "bar.34")
+
+	msg, err = sub2.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, "qux.123")
 }
 
 func TestAccountWildcardRouteMapping(t *testing.T) {

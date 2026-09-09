@@ -683,7 +683,7 @@ func (fs *fileStore) setCreatedTime(created time.Time) {
 	fs.mu.Unlock()
 }
 
-func (fs *fileStore) updateDurabilitySettingsLocked(replicas int) {
+func (fs *fileStore) updateDurabilitySettingsLocked(syncOnFlush bool) {
 	if !fs.fcfg.SyncAlways {
 		return
 	}
@@ -691,13 +691,17 @@ func (fs *fileStore) updateDurabilitySettingsLocked(replicas int) {
 	// setting in favor of SyncOnFlush. Enable the new sync mode
 	// before disabling the old one so writes are never processed
 	// with both modes disabled.
-	if replicas > 1 {
+	if syncOnFlush {
 		fs.syncOnFlush.Store(true)
 		fs.syncAlways.Store(false)
 	} else {
 		fs.syncAlways.Store(true)
 		fs.syncOnFlush.Store(false)
 	}
+}
+
+func (fs *fileStore) resetDurabilitySettingsLocked() {
+	fs.updateDurabilitySettingsLocked(fs.cfg.Replicas > 1)
 }
 
 // flushForScaleDown transitions a SyncOnFlush store back to SyncAlways.
@@ -710,7 +714,7 @@ func (fs *fileStore) flushForScaleDown() error {
 	// Turn off syncOnFlush, and enable sync after every write.
 	// First enable sync after every write, so that any inflight
 	// or subsequent write gets synced
-	fs.updateDurabilitySettingsLocked(1)
+	fs.updateDurabilitySettingsLocked(false)
 	fs.mu.Unlock()
 
 	// Sync all dirty blocks, so that we no longer have to rely
@@ -791,7 +795,7 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 		}
 	}
 
-	fs.updateDurabilitySettingsLocked(cfg.Replicas)
+	fs.resetDurabilitySettingsLocked()
 
 	if lmb := fs.lmb; lmb != nil {
 		// Enable/disable async flush depending on if it's supported and already initialized.
@@ -4325,12 +4329,13 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 		return isSubsetMatchTokenized(tsa, fsa)
 	}
 
-	// Handle last by subject a bit differently.
+	// Use the per-subject index when at most one message per subject should be counted.
+	// This applies to last-per-subject consumers and streams limited to one message per subject.
 	// We will scan PSIM since we accurately track the last block we have seen the subject in. This
 	// allows us to only need to load at most one block now.
 	// For the last block, we need to track the subjects that we know are in that block, and track seen
 	// while in the block itself, but complexity there worth it.
-	if lastPerSubject {
+	if lastPerSubject || fs.cfg.MaxMsgsPer == 1 {
 		// If we want all and our start sequence is equal or less than first return number of subjects.
 		if isAll && sseq <= fs.state.FirstSeq {
 			return uint64(fs.psim.Size()), validThrough, nil
@@ -4665,12 +4670,13 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 		return sl.HasInterest(subj)
 	}
 
-	// Handle last by subject a bit differently.
+	// Use the per-subject index when at most one message per subject should be counted.
+	// This applies to last-per-subject consumers and streams limited to one message per subject.
 	// We will scan PSIM since we accurately track the last block we have seen the subject in. This
 	// allows us to only need to load at most one block now.
 	// For the last block, we need to track the subjects that we know are in that block, and track seen
 	// while in the block itself, but complexity there worth it.
-	if lastPerSubject {
+	if lastPerSubject || fs.cfg.MaxMsgsPer == 1 {
 		// If we want all and our start sequence is equal or less than first return number of subjects.
 		if isAll && sseq <= fs.state.FirstSeq {
 			return uint64(fs.psim.Size()), validThrough, nil
@@ -7989,29 +7995,19 @@ func (mb *msgBlock) recompressOnDiskIfNeeded() error {
 		return err
 	}
 
-	meta := &CompressionInfo{}
-	if _, err := meta.UnmarshalMetadata(origBuf); err != nil {
-		// An error is only returned here if there's a problem with parsing
-		// the metadata. If the file has no metadata at all, no error is
-		// returned and the algorithm defaults to no compression.
-		return fmt.Errorf("failed to read existing metadata header: %w", err)
+	decoded, diskAlg, err := mb.decode(origBuf)
+	if err != nil {
+		return fmt.Errorf("failed to decode original block: %w", err)
 	}
-	if meta.Algorithm == alg {
+	if diskAlg == alg {
 		// The block is already compressed with the chosen algorithm so there
 		// is nothing else to do. This is not a common case, it is here only
 		// to ensure we don't do unnecessary work in case something asked us
 		// to recompress an already compressed block with the same algorithm.
 		return nil
-	} else if alg != NoCompression {
-		// The block is already compressed using some algorithm, so we need
-		// to decompress the block using the existing algorithm before we can
-		// recompress it with the new one.
-		if origBuf, err = meta.Algorithm.Decompress(origBuf); err != nil {
-			return fmt.Errorf("failed to decompress original block: %w", err)
-		}
 	}
 
-	return mb.atomicOverwriteFile(origBuf, true)
+	return mb.atomicOverwriteFile(decoded, true)
 }
 
 // Lock should be held.
@@ -8099,24 +8095,43 @@ func (mb *msgBlock) atomicOverwriteFile(buf []byte, allowCompress bool) error {
 }
 
 // Lock should be held.
-func (mb *msgBlock) decompressIfNeeded(buf []byte) ([]byte, error) {
+func (mb *msgBlock) decode(buf []byte) ([]byte, StoreCompression, error) {
 	var meta CompressionInfo
 	if n, err := meta.UnmarshalMetadata(buf); err != nil {
 		// There was a problem parsing the metadata header of the block.
 		// If there's no metadata header, an error isn't returned here,
 		// we will instead just use default values of no compression.
-		return nil, err
+		return nil, meta.Algorithm, err
 	} else if n == 0 {
 		// There were no metadata bytes, so we assume the block is not
 		// compressed and return it as-is.
-		return buf, nil
+		return buf, NoCompression, nil
 	} else {
-		// Metadata was present so it's quite likely the block contents
-		// are compressed. If by any chance the metadata claims that the
-		// block is uncompressed, then the input slice is just returned
-		// unmodified.
-		return meta.Algorithm.Decompress(buf[n:])
+		// Metadata was present, so try to decompress the block.
+		decoded, err := meta.Algorithm.Decompress(buf[n:])
+		if err == nil {
+			return decoded, meta.Algorithm, nil
+		}
+		// Decompression failed. Before returning the error, check if the
+		// buffer happens to store a valid uncompressed record.
+		// A record with length 24145251 without headers happens to
+		// collide with a valid compression header "cmp" and
+		// compression algorithm 1 (S2).
+		if meta.Algorithm == S2Compression && len(buf) >= 24145251 {
+			var sm StoreMsg
+			if _, msgErr := mb.msgFromBufNoCopy(buf, &sm, mb.hh); msgErr == nil {
+				return buf, NoCompression, nil
+			}
+		}
+		// Return the original error
+		return nil, meta.Algorithm, err
 	}
+}
+
+// Lock should be held.
+func (mb *msgBlock) decompressIfNeeded(buf []byte) ([]byte, error) {
+	decoded, _, err := mb.decode(buf)
+	return decoded, err
 }
 
 // Lock should be held.
@@ -14496,7 +14511,9 @@ func (c *CompressionInfo) UnmarshalMetadata(b []byte) (int, error) {
 	if len(b) < 5 { // 4 + min 1 for uvarint uint64
 		return 0, nil
 	}
-	if b[0] != 'c' || b[1] != 'm' || b[2] != 'p' {
+	// An uncompressed record with length 7,368,035 starts with "cmp",
+	// so we also check algorithm byte.
+	if b[0] != 'c' || b[1] != 'm' || b[2] != 'p' || StoreCompression(b[3]) != S2Compression {
 		return 0, nil
 	}
 	var n int

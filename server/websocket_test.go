@@ -1,4 +1,4 @@
-// Copyright 2020-2025 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -1860,14 +1860,6 @@ func TestWSValidateOptions(t *testing.T) {
 			o.Websocket.Port = 0
 			return o
 		}, ""},
-		{"fips websocket listener", func() *Options {
-			return wso.Clone()
-		}, func() string {
-			if wsAllowedFIPS() {
-				return ""
-			}
-			return "websocket: cannot be used in FIPS-140 mode when built with this Go version, use Go 1.26 or later"
-		}()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateOptions(test.getOpts())

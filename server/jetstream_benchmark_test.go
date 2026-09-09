@@ -1,4 +1,4 @@
-// Copyright 2023-2025 The NATS Authors
+// Copyright 2023-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -36,12 +36,14 @@ import (
 
 func BenchmarkJetStreamConsume(b *testing.B) {
 	const (
-		verbose          = false
-		streamName       = "S"
-		subject          = "s"
-		seed             = 42
-		publishTimeout   = 30 * time.Second
-		PublishBatchSize = 10000
+		verbose        = false
+		streamName     = "S"
+		subject        = "s"
+		seed           = 42
+		publishTimeout = 30 * time.Second
+		// Publishing is setup for this benchmark. Keep batches small enough to
+		// avoid overwhelming replicated streams on slower machines.
+		publishBatchSize = 1000
 	)
 
 	runSyncPushConsumer := func(b *testing.B, js nats.JetStreamContext, streamName string) (int, int, int) {
@@ -314,7 +316,7 @@ func BenchmarkJetStreamConsume(b *testing.B) {
 
 							cl, _, shutdown, nc, js := startJSClusterAndConnect(b, bc.clusterSize)
 							defer shutdown()
-							defer nc.Close()
+							defer func() { nc.Close() }()
 
 							if verbose {
 								b.Logf("Creating stream with R=%d", bc.replicas)
@@ -332,7 +334,12 @@ func BenchmarkJetStreamConsume(b *testing.B) {
 							if bc.replicas > 1 {
 								connectURL := cl.streamLeader("$G", streamName).ClientURL()
 								nc.Close()
-								_, js = jsClientConnectURL(b, connectURL)
+								nc, _ = jsClientConnectURL(b, connectURL)
+							}
+
+							js, err := nc.JetStream(nats.PublishAsyncMaxPending(publishBatchSize))
+							if err != nil {
+								b.Fatalf("Failed to create JetStream context: %v", err)
 							}
 
 							message := make([]byte, bc.messageSize)
@@ -345,15 +352,15 @@ func BenchmarkJetStreamConsume(b *testing.B) {
 								if err != nil {
 									b.Fatalf("Failed to publish: %s", err)
 								}
-								// Limit outstanding published messages to PublishBatchSize
-								if i%PublishBatchSize == 0 || i == b.N {
+								// Drain each batch before publishing more messages.
+								if i%publishBatchSize == 0 || i == b.N {
 									select {
 									case <-js.PublishAsyncComplete():
 										if verbose {
 											b.Logf("Published %d/%d messages", i, b.N)
 										}
 									case <-time.After(publishTimeout):
-										b.Fatalf("Publish timed out")
+										b.Fatalf("Publish timed out with %d acknowledgements pending after publishing %d/%d messages", js.PublishAsyncPending(), i, b.N)
 									}
 								}
 							}
@@ -1009,7 +1016,7 @@ func BenchmarkJetStreamMetaSnapshot(b *testing.B) {
 				Storage:  MemoryStorage,
 				Metadata: metadata,
 			}
-			cfg, _ := ml.checkStreamCfg(scfg, acc, false)
+			cfg, _ := ml.checkStreamCfgLocked(scfg, acc, false)
 			rg, _ := js.createGroupForStream(ci, &cfg)
 			sa := &streamAssignment{Group: rg, Sync: syncSubjForStream(), Config: &cfg, Client: ci, Created: time.Now().UTC()}
 			n.Propose(n.Term(), encodeAddStreamAssignment(sa))
