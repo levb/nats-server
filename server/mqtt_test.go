@@ -10731,3 +10731,110 @@ func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 	}
 	testMQTTExpectNothing(t, msr)
 }
+
+func testMQTTQoS2StagedCount(t *testing.T, s *Server) uint64 {
+	t.Helper()
+	acc, err := s.lookupAccount(globalAccountName)
+	if err != nil {
+		t.Fatalf("Error looking up account: %v", err)
+	}
+	mset, err := acc.lookupStream(mqttQoS2IncomingMsgsStreamName)
+	if err != nil {
+		t.Fatalf("Error looking up stream: %v", err)
+	}
+	return mset.state().Msgs
+}
+
+// The invariant items 1+2 of the correctness plan buy: a PUBCOMP the
+// client receives proves the staged copy was durably discarded, so a
+// PUBREL retransmitted on a later connection (a lost PUBCOMP, from the
+// client's point of view) finds nothing to load and cannot deliver a
+// duplicate. The stream is checked immediately after each PUBCOMP - no
+// polling: the PUBCOMP is gated on the discard's JetStream ack.
+func TestMQTTQoS2PubCompImpliesDiscard(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
+	mcp, mpr := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	const numMsgs = 10
+	for pi := uint16(1); pi <= numMsgs; pi++ {
+		testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte(fmt.Sprintf("msg-%d", pi)))
+		testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
+		testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
+		testMQTTReadPIPacket(mqttPacketPubComp, t, mpr, pi)
+		if n := testMQTTQoS2StagedCount(t, s); n != 0 {
+			t.Fatalf("pi %v: PUBCOMP received but %v staged message(s) remain", pi, n)
+		}
+	}
+
+	// Simulate a PUBCOMP lost in flight: drop the connection without a
+	// DISCONNECT and retransmit the last PUBREL on the resumed session.
+	mcp.Close()
+	mcp2, mpr2 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcp2.Close()
+	testMQTTCheckConnAck(t, mpr2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, numMsgs)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, numMsgs)
+
+	// Exactly one delivery per message, and no duplicate from the
+	// retransmit: the fallback load found nothing.
+	for pi := uint16(1); pi <= numMsgs; pi++ {
+		testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte(fmt.Sprintf("msg-%d", pi)))
+	}
+	testMQTTExpectNothing(t, msr)
+}
+
+// A PUBREL for an exchange staged by a previous connection: the released
+// mark died with that connection, so the delivery comes from the
+// JetStream fallback load - the only dup-candidate path - and its
+// discard uses the sequence the load returned. The retransmitted PUBREL
+// on the same connection is then screened by the released mark.
+func TestMQTTQoS2FallbackLoadDelivery(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	// Stage the message and read the PUBREC, then drop the connection
+	// before the PUBREL.
+	const pi = uint16(5)
+	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
+	mcp, mpr := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte("m"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
+	mcp.Close()
+
+	mcp2, mpr2 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcp2.Close()
+	testMQTTCheckConnAck(t, mpr2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pi)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pi)
+	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("m"))
+	// The PUBCOMP was gated on the seq-addressed discard of the loaded
+	// copy.
+	if n := testMQTTQoS2StagedCount(t, s); n != 0 {
+		t.Fatalf("PUBCOMP received but %v staged message(s) remain", n)
+	}
+
+	// A retransmitted PUBREL on this connection is screened by the
+	// released mark: bare PUBCOMP, no duplicate.
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pi)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pi)
+	testMQTTExpectNothing(t, msr)
+}
