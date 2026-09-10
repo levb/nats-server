@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"slices"
@@ -32,6 +33,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/avl"
 	"github.com/nats-io/nats-server/v2/server/gsl"
 	"github.com/nats-io/nats-server/v2/server/stree"
 	"github.com/nats-io/nuid"
@@ -197,7 +199,18 @@ const (
 	mqttDefaultRetainedCacheTTL = 2 * time.Minute
 	mqttRetainedTransferTimeout = 10 * time.Second
 	mqttDefaultJSAPITimeout     = 5 * time.Second
-	mqttRetainedFlagDelMarker   = '-'
+
+	// How long $MQTT_msgs remembers the message ids of QoS2 deliveries, so
+	// how long after a delivery a PUBREL retransmitted to another server is
+	// still recognized as a duplicate. Covers a discard submitted but not
+	// yet applied, plus a reconnect. A judgment call, not a bound: the JS
+	// API timeout above caps a connection's wait, not the delete request's
+	// life in JetStream, and under a stalled stream the held copy can
+	// outlive any finite window. Left unset the stream would inherit
+	// StreamDefaultDuplicatesWindow, two minutes, and every replica holds
+	// the entries for the whole window.
+	mqttQoS2DedupWindow       = 30 * time.Second
+	mqttRetainedFlagDelMarker = '-'
 )
 
 const (
@@ -300,6 +313,9 @@ type mqttJSPubMsg struct {
 	reply string
 	hdr   int
 	msg   []byte
+	// When set, the sendq consumer adds a Nats-Msg-Id header carrying it to
+	// msg before publishing (see sendJSAPIrequests).
+	msgId string
 }
 
 type mqttRetMsgDel struct {
@@ -414,23 +430,27 @@ type mqtt struct {
 	// QoS1/QoS2 packets. No locking needed inside the read loop.
 	acks *mqttAckPipeline
 
-	// This connection's QoS2 exchanges by packet identifier; read-loop-owned,
-	// no locking. Async stores/discards make JetStream stale while in flight,
-	// so dedup consults this map first; a PUBREL that misses here falls back
-	// to the JetStream load, as the synchronous code did.
+	// Inbound (receiver side) QoS2 state of this connection; read-loop-owned,
+	// no locking. A PI is in at most one of the two. Both are consulted
+	// before JetStream, which is stale while async stores and discards are
+	// in flight; a PUBREL that misses both falls back to the load.
 	//
-	// Non-nil: pending exchange - the held copy (dedups duplicate PUBLISHes,
-	// first wins; delivered on PUBREL without a re-load) and its stream
-	// sequence for the discard. At most mqttMaxAcksInFlight copies are kept.
+	// qos2Exchanges: the pending exchanges. Each holds the copy of the
+	// PUBLISH, which dedups duplicate PUBLISHes (first wins) and is delivered
+	// on PUBREL without a re-load, and its $MQTT_qos2in sequence for the
+	// discard.
 	//
-	// Nil: released, discard possibly in flight - a retransmitted PUBREL gets
-	// a bare PUBCOMP, not a re-load [MQTT-4.3.3-1]. A new PUBLISH replaces the
-	// entry; otherwise it lasts the connection (worst case 65535 entries).
+	// qos2Released: the PIs whose PUBREL has been processed. A retransmitted
+	// PUBREL gets a bare PUBCOMP rather than a re-load [MQTT-4.3.3-1]; a new
+	// PUBLISH on the PI clears the mark. A SequenceSet, as released PIs are
+	// sparse.
+	//
+	// Both die with the connection, deliberately: a reconnect, same server or
+	// not, resolves a retransmitted PUBREL from the stream, and the message
+	// id on the delivery store suppresses a second delivery (see
+	// mqttQoS2DeliveryMsgId).
 	qos2Exchanges map[uint16]*mqttQoS2Exchange
-
-	// Pending (non-nil) entries in qos2Exchanges, for the max inflight
-	// check. Read-loop-owned like the map.
-	qos2PendingCount int
+	qos2Released  avl.SequenceSet
 
 	// rejectQoS2Pub tells the MQTT client to not accept QoS2 PUBLISH, instead
 	// error and terminate the connection.
@@ -1452,14 +1472,24 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	} else if si == nil {
 		// Create the stream for the messages.
 		cfg := &StreamConfig{
-			Name:      mqttStreamName,
-			Subjects:  []string{mqttStreamSubjectPrefix + ">"},
-			Storage:   FileStorage,
-			Retention: InterestPolicy,
-			Replicas:  replicas,
+			Name:       mqttStreamName,
+			Subjects:   []string{mqttStreamSubjectPrefix + ">"},
+			Storage:    FileStorage,
+			Retention:  InterestPolicy,
+			Replicas:   replicas,
+			Duplicates: mqttQoS2DedupWindow,
 		}
 		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
 			return nil, fmt.Errorf("create messages stream for account %q: %v", accName, err)
+		}
+	} else if si.Config.Duplicates > mqttQoS2DedupWindow {
+		// A stream created without an explicit window inherited two
+		// minutes. Best effort: the wider window costs memory, not
+		// correctness, so a failure here must not keep MQTT from
+		// initializing for the account.
+		si.Config.Duplicates = mqttQoS2DedupWindow
+		if _, err := jsa.updateStream(&si.Config); err != nil {
+			s.Warnf("Unable to migrate the duplicates window of the messages stream for account %q: %v", accName, err)
 		}
 	}
 
@@ -1997,9 +2027,8 @@ func (jsa *mqttJSA) storeMsg(subject string, headers int, msg []byte) (*JSPubAck
 }
 
 // A unique reply subject for a JS API request of kind; processJSAPIReplies
-// dispatches on the kind token. Same construction as newRequestExMulti, for
-// the pipelined requests that route replies to their own entries instead of
-// a response channel.
+// dispatches on the kind token. For the pipelined requests, whose replies
+// route to their own entries rather than a response channel.
 func (jsa *mqttJSA) newReplySubject(kind string) string {
 	var sb strings.Builder
 	jsa.mu.Lock()
@@ -2012,17 +2041,16 @@ func (jsa *mqttJSA) newReplySubject(kind string) string {
 	return sb.String()
 }
 
-// Like storeMsg, but does not wait: processJSAPIReplies completes ack.done
-// when the reply arrives. A caller that gives up waiting must delete
-// ack.reply from jsa.replies.
-func (jsa *mqttJSA) storeMsgAsync(subject string, hdr int, msg []byte, ack *mqttPipelinedAck) {
-	ack.reply = jsa.newReplySubject(mqttJSAMsgStore)
-	jsa.replies.Store(ack.reply, ack)
+// Like storeMsg, but does not wait. A non-empty reply routes the response
+// there, and the caller owns the jsa.replies registration for it (see
+// mqttPipelinedAck.submit).
+func (jsa *mqttJSA) storeMsgAsync(subject string, hdr int, msg []byte, msgId, reply string) {
 	jsa.sendq.push(&mqttJSPubMsg{
 		subj:  subject,
-		reply: ack.reply,
+		reply: reply,
 		hdr:   hdr,
 		msg:   msg,
+		msgId: msgId,
 	})
 }
 
@@ -2079,9 +2107,9 @@ func isErrorOtherThan(err error, id ErrorIdentifier) bool {
 // The delete errors meaning the message is already gone: a direct
 // JSSequenceNotFoundErrF or, through the clustered API path that preserves
 // only the text, JSStreamMsgDeleteFailedF wrapping ErrStoreMsgNotFound.
-// Need to scan the error text, the JSON API boundary keeps only
-// ErrCode and description, and that path sets just the generic ErrCode.
-// Session clear tolerates the same pair inline.
+// The text is scanned because the JSON API boundary keeps only ErrCode
+// and description, and that path sets just the generic ErrCode. Session
+// clear tolerates the same pair inline.
 func isMsgAlreadyDeletedErr(err error) bool {
 	return IsNatsErr(err, JSSequenceNotFoundErrF) ||
 		(IsNatsErr(err, JSStreamMsgDeleteFailedF) &&
@@ -2113,8 +2141,24 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 			// set), record its sequence, before sending done.
 			pa := value.(*JSPubAckResponse)
 			err := pa.ToError()
-			if to.exchange != nil && err == nil && pa.PubAck != nil {
-				to.exchange.seq.Store(pa.Sequence)
+			if err != nil && to.respType == mqttPacketPubComp && IsNatsErr(err, JSStreamDuplicateMessageConflict) {
+				pc.Debugf("QoS2 delivery (pi=%v) raced an in-flight store of the same message", to.pi)
+				err = nil
+			}
+			if err == nil && pa.PubAck != nil {
+				if to.exchange != nil {
+					to.exchange.seq.Store(pa.Sequence)
+				}
+				if pa.Duplicate {
+					pc.Debugf("QoS2 delivery (pi=%v) suppressed as a duplicate of stream sequence %v", to.pi, pa.Sequence)
+				}
+			} else if to.exchange != nil && mqttIsMaxMsgsPerSubjectErr(err) {
+				// The copy could not be stored because one was already in
+				// the stream (a retransmitted PUBLISH), so there is no
+				// sequence here; the PUBREL will load the existing copy
+				// instead. The error itself still goes to done, where
+				// exceptDuplicateError clears it for the PUBREC.
+				to.exchange.seq.Store(mqttQoS2SeqUnconfirmed)
 			}
 			to.done <- err
 		case *mqttPipelinedDiscard:
@@ -2457,11 +2501,29 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 					if r.hdr > 0 {
 						// This means that the header has been set by the caller and is
 						// already part of `msg`, so simply set c.pa.hdr to the given value.
-						c.pa.hdr = r.hdr
+						if r.msgId != _EMPTY_ {
+							// Insert the message id before the header
+							// block's terminating CRLF; the buffer is
+							// rebuilt here regardless, for the trailing
+							// CRLF.
+							idLen := len(JSMsgId) + 1 + len(r.msgId) + len(_CRLF_)
+							bb.Grow(len(msg) + idLen + len(_CRLF_))
+							bb.Write(msg[:r.hdr-2])
+							bb.WriteString(JSMsgId)
+							bb.WriteByte(':')
+							bb.WriteString(r.msgId)
+							bb.WriteString(_CRLF_)
+							bb.Write(msg[r.hdr-2:])
+							msg = bb.Bytes()
+							c.pa.hdr = r.hdr + idLen
+						} else {
+							c.pa.hdr = r.hdr
+						}
 						nsize = len(msg)
 						msg = append(msg, _CRLF_...)
 					} else {
 						// We need the ClientInfo header, so add it here.
+						bb.Grow(len(hdrb) + len(r.msg) + len(_CRLF_))
 						bb.Write(hdrb)
 						c.pa.hdr = bb.Len()
 						bb.Write(r.msg)
@@ -4588,15 +4650,16 @@ func (pp *mqttPublish) owesPubAck() bool {
 // mqttAckPipeline emits the acknowledgments of asynchronously submitted
 // stores - PUBACK, PUBREC, PUBCOMP - in the order the packets were
 // received; the single FIFO preserves the per-type ordering of
-// [MQTT-4.6]. A failed or timed-out store closes the connection, like
-// the synchronous path did. mqttPipeline* submit work here; mqttEnqueue*
-// write a packet directly to the outbound buffer.
+// [MQTT-4.6]. A failed or timed-out store closes the connection.
+// mqttPipeline* submit work here; mqttEnqueue* write a packet directly to
+// the outbound buffer.
 //
 // One entry per inbound packet, not per PI: a client may retransmit a
 // PUBLISH before its PUBREC is sent, and each copy owes its own PUBREC
 // [MQTT-4.3.3-1], so q can hold several entries for the same PI at once,
 // each awaiting its own JS ack. Hence a FIFO queue rather than a PI-keyed
-// map; state that spans a QoS2 exchange lives in qos2Exchanges.
+// map; state that spans a QoS2 exchange lives on the connection (see
+// mqtt.qos2Exchanges).
 type mqttAckPipeline struct {
 	jsa      *mqttJSA
 	q        chan *mqttPipelinedAck
@@ -4606,24 +4669,20 @@ type mqttAckPipeline struct {
 
 // The discard leg of a PUBCOMP entry, and its own jsa.replies
 // registration: the delete's result is routed to done, with
-// discard-specific error translation at dispatch. An empty reply means
-// the discard could not be submitted at push time (a PUBREL that raced
-// ahead of its PUBREC, so the held copy's sequence was still unknown): the
-// consumer submits it, reading the sequence from exchange, when the entry
-// reaches the head of the queue - FIFO order guarantees the hold
-// store's own entry completed by then.
+// discard-specific error translation at dispatch. Submitted by the readLoop
+// while building the entry; the held copy's sequence is known by then,
+// since a PUBREL arriving before its PUBREC is rejected (see
+// mqttProcessPubRel).
 type mqttPipelinedDiscard struct {
-	pi       uint16
-	reply    string     // JSA reply subject, to clean up if abandoned.
-	done     chan error // Buffered(1), receives the result of the JS delete.
-	exchange *mqttQoS2Exchange
+	pi    uint16
+	reply string     // JSA reply subject, to clean up if abandoned.
+	done  chan error // Buffered(1), receives the result of the JS delete.
 }
 
 // Registers d in jsa.replies under a fresh reply subject and submits the
 // seq-addressed discard of the held copy; processJSAPIReplies completes
-// d.done when the delete is acked. The registering counterpart of abandon:
-// a caller that gives up waiting must delete d.reply from jsa.replies
-// (mqttPipelinedAck.abandon does both legs).
+// d.done when the delete is acked. The registering counterpart of
+// mqttPipelinedAck.abandon, which cleans up both legs.
 func (d *mqttPipelinedDiscard) submit(jsa *mqttJSA, seq uint64) {
 	d.reply = jsa.newReplySubject(mqttJSAMsgDelete)
 	jsa.replies.Store(d.reply, d)
@@ -4636,18 +4695,29 @@ type mqttPipelinedAck struct {
 	reply    string     // JSA reply subject, to clean up if abandoned.
 	done     chan error // Buffered(1), receives the result of the JS store.
 
-	// The held-copy discard this PUBCOMP is gated on; nil for
-	// PUBACK/PUBREC entries.
+	// At most one of discard and exchange is set, by respType: discard on
+	// PUBCOMP entries, exchange on PUBREC entries, neither on PUBACK.
+
+	// The held-copy discard this PUBCOMP is gated on.
 	discard *mqttPipelinedDiscard
 
-	// Set only on the hold store of a QoS2 PUBLISH with a recorded
-	// exchange: the reply processing captures the held copy's stream
+	// Set only when storing a QoS2 PUBLISH into $MQTT_qos2in with a
+	// recorded exchange: the reply processing captures the copy's stream
 	// sequence into exchange, for the eventual seq-addressed discard. The
 	// capture precedes the send on done, so the sequence is set before
 	// the PUBREC and therefore before any compliant PUBREL. Never set on
 	// the PUBCOMP entry's delivery store - that reply's sequence is not
 	// the held copy's.
 	exchange *mqttQoS2Exchange
+}
+
+// Registers ack in jsa.replies under a fresh reply subject and submits its
+// store; processJSAPIReplies completes ack.done when the reply arrives. The
+// registering counterpart of abandon, like mqttPipelinedDiscard.submit.
+func (ack *mqttPipelinedAck) submit(jsa *mqttJSA, subject string, hdr int, msg []byte, msgId string) {
+	ack.reply = jsa.newReplySubject(mqttJSAMsgStore)
+	jsa.replies.Store(ack.reply, ack)
+	jsa.storeMsgAsync(subject, hdr, msg, msgId, ack.reply)
 }
 
 // Deletes the entry's reply registrations from the account-scoped
@@ -4661,7 +4731,7 @@ func (ack *mqttPipelinedAck) abandon(jsa *mqttJSA) {
 }
 
 // Passes the JS store error through, except the benign one: a
-// max-msgs-per-subject rejection of a PUBREC entry is the hold stream
+// max-msgs-per-subject rejection of a PUBREC entry is $MQTT_qos2in
 // deduping a retransmitted PUBLISH, still owed its PUBREC. For
 // PUBACK/PUBCOMP entries ("$MQTT.msgs.>" stores) the same rejection is a
 // real failure.
@@ -4714,21 +4784,8 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 	for {
 		select {
 		case ack := <-pipe.q:
-			// Submit a deferred discard (see mqttPipelinedDiscard); the
-			// sequence is known by now, unless the hold store itself
-			// failed or was deduped against an unknown prior held copy - fail
-			// then, the exchange resolves via the fallback load on
-			// reconnect.
 			var discardDone chan error
 			if d := ack.discard; d != nil {
-				if d.reply == _EMPTY_ {
-					if seq := d.exchange.seq.Load(); seq != 0 {
-						d.submit(jsa, seq)
-					} else {
-						fail(ack, errors.New("no held copy sequence to discard for the QoS2 exchange"))
-						return
-					}
-				}
 				discardDone = d.done
 			}
 			// One timeout budget covers both legs, and waiting for them in
@@ -4783,21 +4840,21 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 // Submits the JS store; the pipeline sends the respType acknowledgment
 // (PUBACK or PUBREC) with the given pi on its ack, in packet order.
 // readLoop only.
-func (s *Server) mqttPipelineStoreThenAck(c *client, respType byte, pi uint16, subject string, hdrLen int, natsMsg []byte) error {
+func (s *Server) mqttPipelineStoreAndAck(c *client, respType byte, pi uint16, subject string, hdrLen int, natsMsg []byte) error {
 	jsa := c.mqtt.sess.jsa
 	ack := &mqttPipelinedAck{pi: pi, respType: respType, done: make(chan error, 1)}
-	jsa.storeMsgAsync(subject, hdrLen, natsMsg, ack)
+	ack.submit(jsa, subject, hdrLen, natsMsg, _EMPTY_)
 	return s.mqttPipelinePush(c, jsa, ack)
 }
 
-// Submits the hold store of an inbound QoS2 PUBLISH; the pipeline
+// Stores an inbound QoS2 PUBLISH into $MQTT_qos2in; the pipeline
 // sends the PUBREC on its ack, in packet order. When an exchange is
 // recorded, the store's ack also fills in exchange.seq for the eventual
 // seq-addressed discard. readLoop only.
 func (s *Server) mqttPipelineHoldAndPubRec(c *client, pi uint16, subject string, hdrLen int, natsMsg []byte, exchange *mqttQoS2Exchange) error {
 	jsa := c.mqtt.sess.jsa
 	ack := &mqttPipelinedAck{pi: pi, respType: mqttPacketPubRec, done: make(chan error, 1), exchange: exchange}
-	jsa.storeMsgAsync(subject, hdrLen, natsMsg, ack)
+	ack.submit(jsa, subject, hdrLen, natsMsg, _EMPTY_)
 	return s.mqttPipelinePush(c, jsa, ack)
 }
 
@@ -4812,38 +4869,30 @@ func (s *Server) mqttPipelineAck(c *client, respType byte, pi uint16) error {
 }
 
 // Submits both PUBREL-time JS interactions - the delivery store and the
-// seq-addressed discard of the held copy - and gates the PUBCOMP on
-// both acks. The two requests are in flight concurrently, so the entry
-// costs max(store, discard), not the sum. A PUBCOMP the client receives
-// therefore proves the held copy is durably gone: a cross-connection
-// PUBREL retransmit after it finds nothing to load and cannot deliver a
-// duplicate. readLoop only.
-//
-// When heldSeq is still zero (a PUBREL that raced ahead of its PUBREC)
-// the discard is deferred to the pipeline consumer, which reads the
-// sequence from exchange once the hold store's own entry has completed.
-func (s *Server) mqttPipelineStoreDiscardThenComp(c *client, pi uint16, heldSeq uint64, exchange *mqttQoS2Exchange, subject string, hdrLen int, natsMsg []byte) error {
+// seq-addressed discard of the held copy - and gates the PUBCOMP on both
+// acks. The two are in flight concurrently, so the entry costs max(store,
+// discard), not the sum. The delivery store carries a message id derived
+// from heldSeq, so that a PUBREL retransmitted to another server stores the
+// same id and is dropped as a duplicate (see mqttQoS2DeliveryMsgId).
+// readLoop only.
+func (s *Server) mqttPipelineReleaseAndPubComp(c *client, pi uint16, heldSeq uint64, subject string, hdrLen int, natsMsg []byte) error {
 	jsa := c.mqtt.sess.jsa
 	ack := &mqttPipelinedAck{pi: pi, respType: mqttPacketPubComp, done: make(chan error, 1),
-		discard: &mqttPipelinedDiscard{pi: pi, done: make(chan error, 1), exchange: exchange}}
-	if heldSeq != 0 {
-		ack.discard.submit(jsa, heldSeq)
-	}
-	jsa.storeMsgAsync(subject, hdrLen, natsMsg, ack)
+		discard: &mqttPipelinedDiscard{pi: pi, done: make(chan error, 1)}}
+	ack.discard.submit(jsa, heldSeq)
+	ack.submit(jsa, subject, hdrLen, natsMsg, mqttQoS2DeliveryMsgId(heldSeq))
 	return s.mqttPipelinePush(c, jsa, ack)
 }
 
-// Like mqttPipelineStoreDiscardThenComp for a PUBREL whose message was
+// Like mqttPipelineReleaseAndPubComp for a PUBREL whose message was
 // dropped (permission violation): no delivery store, but the PUBCOMP is
 // still gated on the discard ack. readLoop only.
-func (s *Server) mqttPipelineDiscardThenComp(c *client, pi uint16, heldSeq uint64, exchange *mqttQoS2Exchange) error {
+func (s *Server) mqttPipelineDiscardAndPubComp(c *client, pi uint16, heldSeq uint64) error {
 	jsa := c.mqtt.sess.jsa
 	ack := &mqttPipelinedAck{pi: pi, respType: mqttPacketPubComp, done: make(chan error, 1),
-		discard: &mqttPipelinedDiscard{pi: pi, done: make(chan error, 1), exchange: exchange}}
+		discard: &mqttPipelinedDiscard{pi: pi, done: make(chan error, 1)}}
 	ack.done <- nil
-	if heldSeq != 0 {
-		ack.discard.submit(jsa, heldSeq)
-	}
+	ack.discard.submit(jsa, heldSeq)
 	return s.mqttPipelinePush(c, jsa, ack)
 }
 
@@ -4874,22 +4923,11 @@ func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, ack *mqttPipelinedAck
 	pipe := c.mqtt.acks
 	if pipe == nil {
 		if pipe = s.mqttPipelineStart(c, jsa); pipe == nil {
-			// Server is shutting down, complete synchronously. Earlier
-			// packets completed synchronously too, in order, so a deferred
-			// discard's sequence is known here for the same reason as in
-			// the consumer.
+			// Server is shutting down, complete synchronously.
 			t := time.NewTimer(jsa.timeout)
 			defer t.Stop()
 			var discardDone chan error
 			if d := ack.discard; d != nil {
-				if d.reply == _EMPTY_ {
-					if seq := d.exchange.seq.Load(); seq != 0 {
-						d.submit(jsa, seq)
-					} else {
-						ack.abandon(jsa)
-						return errors.New("no held copy sequence to discard for the QoS2 exchange")
-					}
-				}
 				discardDone = d.done
 			}
 			for _, done := range [2]chan error{ack.done, discardDone} {
@@ -5042,7 +5080,7 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 	// synchronously. QoS2 PUBREL-initiated deliveries take
 	// mqttProcessPubRel's own pipelined path, not this one.
 	if pp.owesPubAck() {
-		return s.mqttPipelineStoreThenAck(c, mqttPacketPubAck, pp.pi, subject, headerLen, natsMsg)
+		return s.mqttPipelineStoreAndAck(c, mqttPacketPubAck, pp.pi, subject, headerLen, natsMsg)
 	}
 
 	_, err := c.mqtt.sess.jsa.storeMsg(subject, headerLen, natsMsg)
@@ -5052,8 +5090,9 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 
 var mqttMaxMsgErrPattern = fmt.Sprintf("%s (%v)", ErrMaxMsgsPerSubject.Error(), JSStreamStoreFailedF)
 
-// A QoS2 hold store hitting the stream's max-msgs-per-subject limit means
-// the message was already held for an earlier (duplicate) PUBLISH.
+// A QoS2 PUBLISH's store into $MQTT_qos2in hitting the stream's
+// max-msgs-per-subject limit means the message was already held for an
+// earlier (duplicate) PUBLISH.
 //
 // TODO: would prefer a more robust and performant way of checking the
 // error, but it comes back wrapped as an API result.
@@ -5065,39 +5104,65 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 	return mqttQoS2IncomingMsgsStreamSubjectPrefix + c.mqtt.cid + "." + strconv.FormatUint(uint64(pi), 10)
 }
 
+// Tags the delivery of an inbound QoS2 PUBLISH, so that a PUBREL
+// retransmitted to another server, which resolves it by loading the same
+// held copy, stores the same id and is dropped as a duplicate. The held
+// copy's sequence is stable across retransmissions of one publication
+// (max-msgs-per-subject pins it to one sequence) and distinct across
+// publications (a reused PI lands at a new sequence). Client id plus PI
+// would satisfy only the first, and silently drop a new publication on a
+// reused PI.
+func mqttQoS2DeliveryMsgId(heldSeq uint64) string {
+	return "q2-" + strconv.FormatUint(heldSeq, 10)
+}
+
+// mqttQoS2Exchange.seq when the copy could not be stored because one was
+// already in $MQTT_qos2in (a retransmitted PUBLISH). The reply carries no
+// sequence then, so the PUBREL loads the existing copy and reads it there.
+const mqttQoS2SeqUnconfirmed = math.MaxUint64
+
 // A pending entry in qos2Exchanges: the kept copy of the PUBLISH plus the
 // held copy's stream sequence for the seq-addressed discard on PUBREL.
 type mqttQoS2Exchange struct {
 	pp *mqttPublish
 
-	// The held copy's sequence in $MQTT_qos2in, for the discard on PUBREL.
-	// Written by the reply processing when JetStream acks the hold store
-	// (see processJSAPIReplies), read by the readLoop on PUBREL. The write
-	// precedes the PUBREC, and a compliant PUBREL follows the PUBREC
-	// [MQTT-4.3.3-1 flow], so a zero here means the client jumped the
-	// flow. Atomic: writer and reader are different goroutines.
+	// The held copy's sequence in $MQTT_qos2in, for the discard on PUBREL,
+	// or mqttQoS2SeqUnconfirmed. Written by the reply processing when
+	// JetStream answers the store (see processJSAPIReplies), read by the
+	// readLoop on PUBREL. The write precedes the PUBREC, and a compliant
+	// PUBREL follows the PUBREC [MQTT-4.3.3-1], so a zero here means the
+	// client jumped the flow. Atomic: for a compliant client the only
+	// ordering between writer and reader runs through the wire, which the
+	// memory model does not see; for an early PUBREL there is none at all.
 	seq atomic.Uint64
 }
 
 // Copies an inbound QoS2 PUBLISH (the slices point into the readLoop
 // buffer) into qos2Exchanges, for its PUBREL to deliver without a
-// re-load. A released entry is always dropped first: any PUBLISH on a
+// re-load. A released mark is always cleared first: any PUBLISH on a
 // released PI - kept or not - is a new publication [MQTT-4.3.3-1].
 // Returns the recorded exchange, or nil when no copy is kept (duplicates,
 // unknown DUP retransmits, over-cap extras) - the PUBREL then falls back
 // to the JetStream load, which also recovers the sequence. readLoop only.
 func (c *client) mqttRecordQoS2Publish(pp *mqttPublish) *mqttQoS2Exchange {
-	if prev, ok := c.mqtt.qos2Exchanges[pp.pi]; ok {
-		if prev != nil {
-			// A duplicate PUBLISH: keep the first copy, as the JetStream
-			// hold store does (max-msgs-per-subject), so both deliver the same
-			// bytes.
-			return nil
-		}
+	// The copy is dropped below if it turns out not to be worth keeping,
+	// which only happens on retransmits and at the cap.
+	cp := *pp
+	cp.topic = append([]byte(nil), pp.topic...)
+	cp.subject = append([]byte(nil), pp.subject...)
+	cp.mapped = append([]byte(nil), pp.mapped...)
+	cp.msg = append([]byte(nil), pp.msg...)
 
-		// Released: a new publication, DUP or not [MQTT-4.3.3-1]. Drop the
-		// nil entry.
-		delete(c.mqtt.qos2Exchanges, pp.pi)
+	m := c.mqtt
+	if _, held := m.qos2Exchanges[pp.pi]; held {
+		// A duplicate PUBLISH: keep the first copy, as the JetStream hold
+		// store does (max-msgs-per-subject), so both deliver the same bytes.
+		return nil
+	}
+
+	if m.qos2Released.Exists(uint64(pp.pi)) {
+		// A new publication on a released PI, DUP or not [MQTT-4.3.3-1].
+		m.qos2Released.Delete(uint64(pp.pi))
 	} else if pp.flags&mqttPubFlagDup != 0 {
 		// A DUP retransmit unknown here may duplicate a copy held by a
 		// previous connection; only JetStream knows which bytes were
@@ -5107,21 +5172,14 @@ func (c *client) mqttRecordQoS2Publish(pp *mqttPublish) *mqttQoS2Exchange {
 
 	// Defense in depth: in practice the pipeline window (same size) fills
 	// and blocks the readLoop before the count can get here.
-	if c.mqtt.qos2PendingCount >= mqttMaxAcksInFlight {
+	if len(m.qos2Exchanges) >= mqttMaxAcksInFlight {
 		return nil
 	}
-	cp := *pp
-	cp.topic = append([]byte(nil), pp.topic...)
-	cp.subject = append([]byte(nil), pp.subject...)
-	cp.mapped = append([]byte(nil), pp.mapped...)
-	cp.msg = append([]byte(nil), pp.msg...)
-
-	if c.mqtt.qos2Exchanges == nil {
-		c.mqtt.qos2Exchanges = make(map[uint16]*mqttQoS2Exchange)
+	if m.qos2Exchanges == nil {
+		m.qos2Exchanges = make(map[uint16]*mqttQoS2Exchange)
 	}
 	exchange := &mqttQoS2Exchange{pp: &cp}
-	c.mqtt.qos2Exchanges[pp.pi] = exchange
-	c.mqtt.qos2PendingCount++
+	m.qos2Exchanges[pp.pi] = exchange
 	return exchange
 }
 
@@ -5129,32 +5187,28 @@ func (c *client) mqttRecordQoS2Publish(pp *mqttPublish) *mqttQoS2Exchange {
 // retransmission. (nil, false) means unknown here: fall back to the
 // JetStream load. readLoop only.
 func (c *client) mqttTakeQoS2Publish(pi uint16) (exchange *mqttQoS2Exchange, released bool) {
-	exchange, ok := c.mqtt.qos2Exchanges[pi]
-	return exchange, ok && exchange == nil
+	if exchange, held := c.mqtt.qos2Exchanges[pi]; held {
+		return exchange, false
+	}
+	return nil, c.mqtt.qos2Released.Exists(uint64(pi))
 }
 
 // Moves the exchange pending -> released: the delivery is initiated and
-// the held copy's discard submitted. The released entry screens
+// the held copy's discard submitted. The released mark screens
 // retransmitted PUBRELs off the JetStream load until the PI is reused.
 // readLoop only.
 func (c *client) mqttMarkQoS2Released(pi uint16) {
-	if c.mqtt.qos2Exchanges == nil {
-		c.mqtt.qos2Exchanges = make(map[uint16]*mqttQoS2Exchange)
-	} else if exchange, ok := c.mqtt.qos2Exchanges[pi]; ok && exchange != nil {
-		c.mqtt.qos2PendingCount--
-	}
-	c.mqtt.qos2Exchanges[pi] = nil
+	delete(c.mqtt.qos2Exchanges, pi)
+	c.mqtt.qos2Released.Insert(uint64(pi))
 }
 
 // Process a PUBREL (QoS2, acting as Receiver) - the second async JS
 // interaction (see qos2Exchanges): deliver the held message
 // [MQTT-4.3.3-2], discard its held copy by exact stream sequence, and
-// PUBCOMP through the ack pipeline once JetStream acks BOTH the delivery
-// store and the discard. A PUBCOMP the client receives therefore proves
-// the held copy is gone: a PUBREL retransmitted on a later connection
-// finds nothing to load and cannot deliver a duplicate. Delivered from
-// the qos2Exchanges copy; on a miss re-loaded from JetStream, unless the
-// exchange is marked released (a retransmission).
+// PUBCOMP through the ack pipeline once JetStream acks both the delivery
+// store and the discard. Delivered from the qos2Exchanges copy; on a miss
+// loaded from JetStream, unless the exchange is marked released (a
+// retransmission).
 //
 // Runs from the client's readLoop. No lock held on entry.
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
@@ -5168,14 +5222,39 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	var pp *mqttPublish
 	var heldSeq uint64
 	if exchange != nil {
-		pp = exchange.pp
-		heldSeq = exchange.seq.Load()
-	} else {
-		// All load failures are treated as "not found".
-		stored, _ := c.mqtt.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, c.mqttQoS2InternalSubject(pi))
-		if stored == nil {
-			// Nothing pending for this PI, just acknowledge.
-			return s.mqttPipelineAck(c, mqttPacketPubComp, pi)
+		switch seq := exchange.seq.Load(); seq {
+		case 0:
+			// The sender sends PUBREL only in response to PUBREC
+			// [MQTT-4.3.3-1], and the sequence, or the unconfirmed mark,
+			// is recorded before that PUBREC goes out, so a compliant
+			// client cannot get here with a zero. Without the sequence
+			// there is no message id for the delivery and nothing to
+			// address the discard to.
+			return fmt.Errorf("QoS2 PUBREL (pi=%v) received before its PUBREC was sent", pi)
+		case mqttQoS2SeqUnconfirmed:
+			// The copy this exchange holds was deduped against one
+			// already in the stream, whose sequence only the stream
+			// knows. Resolve from there, as if nothing were held; drop
+			// the entry too, or a bare PUBCOMP below would leave it to
+			// misclassify the PI's next PUBLISH as a duplicate.
+			delete(c.mqtt.qos2Exchanges, pi)
+			exchange = nil
+		default:
+			pp, heldSeq = exchange.pp, seq
+		}
+	}
+	if exchange == nil {
+		stored, err := c.mqtt.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, c.mqttQoS2InternalSubject(pi))
+		if err != nil {
+			if IsNatsErr(err, JSNoMessageFoundErr) {
+				// Nothing pending for this PI, just acknowledge.
+				return s.mqttPipelineAck(c, mqttPacketPubComp, pi)
+			}
+			// Any other failure - a timeout, no stream leader - says
+			// nothing about whether a copy is held. A PUBCOMP here would
+			// strand it undelivered; fail the connection instead, and
+			// the client retransmits the PUBREL on reconnect.
+			return fmt.Errorf("unable to load the held QoS2 message (pi=%v): %v", pi, err)
 		}
 		// Only MQTT QoS2 messages should be here, and they must have a subject.
 		h := mqttParsePublishNATSHeader(stored.Header)
@@ -5201,17 +5280,12 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 			flags:   flags,
 		}
 		heldSeq = stored.Sequence
-		// The only delivery path that can duplicate: the released mark
-		// that would have screened this PUBREL died with a previous
-		// connection. Expected only on session resumptions.
+		// The only path that can re-broadcast a publication: this
+		// connection has no released mark for it. Expected only on
+		// session resumptions.
 		c.Debugf("Delivering QoS2 PUBREL (pi=%v) from a JetStream load; the message was held by a previous connection", pi)
 	}
 
-	// A zero heldSeq here means the PUBREL raced ahead of its PUBREC (a
-	// flow the spec forbids the sender, [MQTT-4.3.3-1], but the old
-	// synchronous code tolerated): the discard is then deferred to the
-	// pipeline consumer, which knows the sequence by FIFO order.
-	//
 	// The discard is seq-addressed, so it cannot hit a successor held
 	// copy on a reused PI, and the PUBCOMP below waits for its ack.
 	// Retransmitted PUBRELs racing it are screened by the released mark.
@@ -5223,13 +5297,13 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	if permIssue {
 		// The message was dropped, but the client is still owed the
 		// PUBCOMP - gated on the discard ack like the delivered case.
-		return s.mqttPipelineDiscardThenComp(c, pi, heldSeq, exchange)
+		return s.mqttPipelineDiscardAndPubComp(c, pi, heldSeq)
 	}
 
 	// See mqttInitiateMsgDelivery for why flushClients is needed before the
 	// store.
 	c.flushClients(0)
-	return s.mqttPipelineStoreDiscardThenComp(c, pi, heldSeq, exchange, subject, headerLen, natsMsg)
+	return s.mqttPipelineReleaseAndPubComp(c, pi, heldSeq, subject, headerLen, natsMsg)
 }
 
 // Invoked when processing an inbound client message. If the "retain" flag is

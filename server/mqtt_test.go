@@ -10568,9 +10568,16 @@ func TestMQTTQoS2AckPipelineConnClose(t *testing.T) {
 	// A burst of QoS2 PUBLISHes, some released, then an abrupt close with
 	// everything unread.
 	const numMsgs = 50
-	mcp, _ := testMQTTConnect(t, &mqttConnInfo{clientID: "pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
 	for pi := uint16(1); pi <= numMsgs; pi++ {
 		testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte(fmt.Sprintf("msg-%d", pi)))
+	}
+	// A PUBREL follows its own PUBREC [MQTT-4.3.3-1], so read those before
+	// releasing. Everything after them is left unread, which is what the
+	// abrupt close below is meant to strand.
+	for pi := uint16(1); pi <= numMsgs/2; pi++ {
+		testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
 	}
 	for pi := uint16(1); pi <= numMsgs/2; pi++ {
 		testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
@@ -10730,6 +10737,258 @@ func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 		testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte(fmt.Sprintf("cycle-%d", i)))
 	}
 	testMQTTExpectNothing(t, msr)
+}
+
+// A PUBREL retransmitted on a reconnect, here to the same server, must not
+// deliver the message to QoS1+ subscribers a second time, even while the
+// held copy's discard is still in flight. The new connection has no
+// in-memory state for the exchange, falls back to the JetStream load, finds
+// the undeleted copy and re-stores it - and that store carries the same
+// message id as the first, so JetStream drops it. Same guarantee as the
+// cross-server case (TestMQTTQoS2CrossServerRetransmitDeduped), by design.
+func TestMQTTQoS2SameServerRetransmitDeduped(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	const pi = uint16(3)
+	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
+	mcp, mpr := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte("m"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
+
+	// Steal the discard so the held copy stays in the stream, as a
+	// backlogged JS API would leave it.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	const interceptSubj = "mqtt.test.discard.intercept"
+	interceptSub := natsSubSync(t, nc, interceptSubj)
+	natsFlush(t, nc)
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	require_NoError(t, acc.AddMapping(fmt.Sprintf(JSApiMsgDeleteT, mqttQoS2IncomingMsgsStreamName), interceptSubj))
+
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
+	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("m"))
+	natsNexMsg(t, interceptSub, 2*time.Second)
+	if n := testMQTTQoS2HeldCount(t, s); n != 1 {
+		t.Fatalf("Expected the held copy to still be present, got %v", n)
+	}
+	// Stop intercepting: only this exchange's discard was stolen, so
+	// anything the next connection does proceeds normally.
+	require_True(t, acc.RemoveMapping(fmt.Sprintf(JSApiMsgDeleteT, mqttQoS2IncomingMsgsStreamName)))
+
+	// Reconnect to the same server and retransmit the PUBREL.
+	mcp.Close()
+	mcp2, mpr2 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcp2.Close()
+	testMQTTCheckConnAck(t, mpr2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pi)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pi)
+	// A duplicate would arrive through the delivery consumer; give it time
+	// to surface before asserting silence.
+	time.Sleep(500 * time.Millisecond)
+	testMQTTExpectNothing(t, msr)
+}
+
+// The cross-server half of window D. A PUBREL retransmitted on a different
+// server has no released mark to consult, so it resolves the exchange by
+// loading the held copy, which is still there while the discard is in
+// flight. The delivery it then stores carries the same message id as the
+// first one, derived from that copy's sequence, so JetStream drops it and
+// the subscriber sees the message exactly once.
+func TestMQTTQoS2CrossServerRetransmitDeduped(t *testing.T) {
+	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplaceNoLeaf(), "MQTT", 2)
+	defer cl.shutdown()
+
+	o0, o1 := cl.opts[0], cl.opts[1]
+
+	mcs, msr := testMQTTConnectRetry(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o0.MQTT.Host, o0.MQTT.Port, 5)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	const pi = uint16(3)
+	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
+	mcp, mpr := testMQTTConnectRetry(t, ci, o0.MQTT.Host, o0.MQTT.Port, 5)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte("m"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
+
+	// Steal this exchange's discard so the held copy survives the reconnect,
+	// which is what makes the second server load and deliver it again.
+	nc := natsConnect(t, cl.randomServer().ClientURL())
+	defer nc.Close()
+	const interceptSubj = "mqtt.test.discard.intercept"
+	interceptSub := natsSubSync(t, nc, interceptSubj)
+	natsFlush(t, nc)
+	deleteSubj := fmt.Sprintf(JSApiMsgDeleteT, mqttQoS2IncomingMsgsStreamName)
+	for _, s := range cl.servers {
+		acc, err := s.lookupAccount(globalAccountName)
+		require_NoError(t, err)
+		require_NoError(t, acc.AddMapping(deleteSubj, interceptSubj))
+	}
+
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
+	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("m"))
+	natsNexMsg(t, interceptSub, 5*time.Second)
+	// Stop intercepting: only this exchange's discard was stolen, so the
+	// second server's own discard proceeds normally.
+	for _, s := range cl.servers {
+		acc, err := s.lookupAccount(globalAccountName)
+		require_NoError(t, err)
+		require_True(t, acc.RemoveMapping(deleteSubj))
+	}
+	mcp.Close()
+
+	// Reconnect to the other server and retransmit. It has no released mark
+	// for this session, so it takes the fallback load.
+	mcp2, mpr2 := testMQTTConnectRetry(t, ci, o1.MQTT.Host, o1.MQTT.Port, 5)
+	defer mcp2.Close()
+	testMQTTCheckConnAck(t, mpr2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pi)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pi)
+
+	// A duplicate would arrive through the delivery consumer; give it time
+	// to surface before asserting silence.
+	time.Sleep(time.Second)
+	testMQTTExpectNothing(t, msr)
+}
+
+// Only QoS2 deliveries carry a message id. If QoS1 publishes carried one the
+// dedup map would hold an entry per message on the busiest path, and if QoS2
+// deliveries did not the cross-server retransmit would go unrecognized.
+func TestMQTTQoS2DeliveryMsgIdOnlyForQoS2(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSendPublishPacket(t, mcp, 1, false, false, "foo", 1, []byte("q1"))
+	testMQTTReadPIPacket(mqttPacketPubAck, t, mpr, 1)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", 2, []byte("q2"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, 2)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, 2)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr, 2)
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	js, err := nc.JetStream()
+	require_NoError(t, err)
+
+	var ids []string
+	for seq := uint64(1); seq <= 2; seq++ {
+		sm, err := js.GetMsg(mqttStreamName, seq)
+		require_NoError(t, err)
+		ids = append(ids, sm.Header.Get(JSMsgId))
+	}
+	if ids[0] != _EMPTY_ {
+		t.Fatalf("QoS1 publish carried a message id %q", ids[0])
+	}
+	if !strings.HasPrefix(ids[1], "q2-") {
+		t.Fatalf("QoS2 delivery message id %q is not sequence-derived", ids[1])
+	}
+	// The id names the held copy, so it must not be the delivery's own
+	// sequence in $MQTT_msgs, and must survive as the dedup key.
+	if ids[1] == mqttQoS2DeliveryMsgId(2) {
+		t.Fatalf("message id %q looks like the delivery sequence, not the held copy's", ids[1])
+	}
+}
+
+// A PUBREL is sent only in response to a PUBREC [MQTT-4.3.3-1]. One that
+// arrives before its PUBREC leaves the held copy's sequence unknown, so
+// there is no message id for the delivery and nothing to address the
+// discard to, and the connection is failed rather than carrying machinery
+// to resolve the sequence afterwards.
+func TestMQTTQoS2PubRelBeforePubRecFailsConn(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Divert the hold store so its ack never arrives and the sequence stays
+	// unknown, making the race deterministic.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	const pi = uint16(4)
+	require_NoError(t, acc.AddMapping(
+		fmt.Sprintf("%spub.%d", mqttQoS2IncomingMsgsStreamSubjectPrefix, pi), "mqtt.test.hold.sink"))
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{clientID: "pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte("m"))
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
+
+	// Closed by the PUBREL rejection, which is immediate, not by the much
+	// later JetStream ack timeout.
+	start := time.Now()
+	testMQTTExpectDisconnect(t, mcp)
+	if elapsed := time.Since(start); elapsed > mqttDefaultJSAPITimeout/2 {
+		t.Fatalf("Connection closed after %v, looks like the JS timeout rather than the PUBREL rejection", elapsed)
+	}
+}
+
+// A PUBLISH whose copy is already in $MQTT_qos2in from a previous
+// connection, retransmitted without the DUP flag so a fresh exchange is
+// recorded for it. Its hold store is deduped by the stream, which yields no
+// sequence, so the exchange is marked unconfirmed and the PUBREL resolves
+// from the stream instead of being rejected as premature. The message must
+// be delivered exactly once and the connection must survive.
+func TestMQTTQoS2RetransmitWithoutDupResolvesFromStream(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	mcs, msr := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, msr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, mcs, msr, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+	testMQTTFlush(t, mcs, nil, msr)
+
+	// Hold a copy, then lose the connection before the PUBREL.
+	const pi = uint16(6)
+	ci := &mqttConnInfo{clientID: "pub", cleanSess: false}
+	mcp, mpr := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte("m"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
+	mcp.Close()
+
+	// Retransmit it with DUP clear (dup=false), so the new connection keeps
+	// a copy and records an exchange, whose hold store the stream dedups.
+	mcp2, mpr2 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcp2.Close()
+	testMQTTCheckConnAck(t, mpr2, mqttConnAckRCConnectionAccepted, true)
+	testMQTTSendPublishPacket(t, mcp2, 2, false, false, "foo", pi, []byte("m"))
+	testMQTTReadPIPacket(mqttPacketPubRec, t, mpr2, pi)
+	testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp2, pi)
+	testMQTTReadPIPacket(mqttPacketPubComp, t, mpr2, pi)
+
+	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("m"))
+	time.Sleep(500 * time.Millisecond)
+	testMQTTExpectNothing(t, msr)
+	if n := testMQTTQoS2HeldCount(t, s); n != 0 {
+		t.Fatalf("PUBCOMP received but %v held message(s) remain", n)
+	}
 }
 
 func testMQTTQoS2HeldCount(t *testing.T, s *Server) uint64 {
