@@ -250,9 +250,7 @@ var (
 	errMQTTInvalidRetainedMessage     = errors.New("invalid retained message")
 	errMQTTSessionCollision           = errors.New("stored session does not match client ID")
 	errMQTTInvalidPublishLength       = errors.New("invalid publish message, variable header exceeds remaining length")
-	errMQTTAckPipelineStopped         = errors.New("ack pipeline has shut down while admitting a packet, " +
-		"abandoning the wait for its JetStream ack; failing the connection, " +
-		"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect")
+	errMQTTAckPipelineStopped         = errors.New("ack pipeline stopped while admitting a packet")
 )
 
 type srvMQTT struct {
@@ -4571,10 +4569,6 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		// Message before sending the PUBREC or PUBCOMP. When its original
 		// sender receives the PUBREC packet, ownership of the Application
 		// Message is transferred to the receiver.
-		//
-		// Hold the message as "$MQTT.qos2.<client-id>.<PI>" until the sender
-		// releases it, and keep a copy so the PUBREL needs no re-load. A
-		// duplicate's store is a no-op but still gets its PUBREC, in order.
 		natsMsg, headerLen := mqttNewDeliverableMessage(pp, true)
 		return s.mqttPipelineHoldAndPubRec(c, pp.pi,
 			c.mqttQoS2InternalSubject(pp.pi), headerLen, natsMsg, c.mqttRecordQoS2Publish(pp))
@@ -4625,17 +4619,18 @@ type mqttAckPipeline struct {
 	quitOnce sync.Once
 }
 
-// A pending PUBACK, PUBREC or PUBCOMP, gated on the JetStream replies to
-// the operations it submitted. Registered in jsa.replies under each reply
-// subject; processJSAPIReplies completes the matching leg.
+// mqttPipelinedResponse represents a PUBACK, PUBREC or PUBCOMP waiting for
+// JetStream to acknowledge the operations behind it.
 type mqttPipelinedResponse interface {
 	respType() byte
 	packetID() uint16
+
 	// The reply channels, in order; nil where there is no operation. Each
 	// is buffered(1) and completed at most once.
 	waitOn() [2]chan error
-	// Removes the reply registrations from the account-scoped jsa.replies,
-	// which outlives the connection; every give-up path must call this.
+
+	// Removes the reply registrations from the account-scoped jsa.replies;
+	// every give-up path must call this.
 	abandon(jsa *mqttJSA)
 }
 
@@ -4743,16 +4738,13 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 
 	fail := func(r mqttPipelinedResponse, err error) {
 		r.abandon(jsa)
-		c.Errorf("unable to store QoS1/2 message in JetStream (pi=%v): %v; "+
-			"closing the connection, the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect",
-			r.packetID(), err)
+		c.Errorf("unable to store QoS1/2 message in JetStream (pi=%v): %v; closing the connection", r.packetID(), err)
 		c.closeConnection(ProtocolViolation)
 	}
 
 	for {
 		select {
 		case r := <-pipe.q:
-			// One budget for both operations; they are in flight concurrently.
 			t.Reset(jsa.timeout)
 			for _, done := range r.waitOn() {
 				if done == nil {
@@ -4770,14 +4762,14 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 					return
 
 				case <-pipe.quitCh:
-					// pipe.shutdown only covers entries still queued; this
-					// one is ours to clean up.
+					// pipe.shutdown only covers entries still queued; this one
+					// is ours to clean up.
 					r.abandon(jsa)
 					return
 
 				case <-s.quitCh:
-					// pipe.shutdown only covers entries still queued; this
-					// one is ours to clean up.
+					// pipe.shutdown only covers entries still queued; this one
+					// is ours to clean up.
 					r.abandon(jsa)
 					return
 				}
@@ -4883,9 +4875,7 @@ func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, r mqttPipelinedRespon
 					}
 				case <-t.C:
 					r.abandon(jsa)
-					return fmt.Errorf("JetStream did not acknowledge the QoS1/2 message within %v "+
-						"(server is shutting down); failing the connection, "+
-						"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect", jsa.timeout)
+					return fmt.Errorf("no JetStream ack within %v during server shutdown", jsa.timeout)
 				case <-s.quitCh:
 					// The reply may never come; do not hold up the shutdown.
 					r.abandon(jsa)
@@ -4931,9 +4921,7 @@ func (pipe *mqttAckPipeline) push(r mqttPipelinedResponse) error {
 		case <-pipe.quitCh:
 		case <-t.C:
 			r.abandon(jsa)
-			return fmt.Errorf("in-flight window is full (%d packets) and JetStream has not acknowledged "+
-				"the oldest one within %v; failing the connection, "+
-				"the client will re-send unacknowledged PUBLISH and PUBREL packets on reconnect",
+			return fmt.Errorf("in-flight window full (%d packets), no JetStream ack for the oldest within %v",
 				mqttMaxAcksInFlight, jsa.timeout)
 		}
 	}
