@@ -10449,7 +10449,7 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 		jsa := &mqttJSA{timeout: time.Second}
 		pipe := &mqttAckPipeline{
 			jsa:    jsa,
-			q:      make(chan mqttPipelinedResponse, 4),
+			q:      make(chan mqttPipelined, 4),
 			quitCh: make(chan struct{}),
 		}
 
@@ -10488,7 +10488,7 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 	jsa := &mqttJSA{timeout: time.Second}
 	pipe := &mqttAckPipeline{
 		jsa:    jsa,
-		q:      make(chan mqttPipelinedResponse, 4),
+		q:      make(chan mqttPipelined, 4),
 		quitCh: make(chan struct{}),
 	}
 	pipe.shutdown()

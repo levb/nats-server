@@ -4614,14 +4614,14 @@ func (pp *mqttPublish) owesPubAck() bool {
 // for one PI. Exchange-spanning state lives in mqtt.qos2Exchanges.
 type mqttAckPipeline struct {
 	jsa      *mqttJSA
-	q        chan mqttPipelinedResponse
+	q        chan mqttPipelined
 	quitCh   chan struct{}
 	quitOnce sync.Once
 }
 
-// mqttPipelinedResponse represents a PUBACK, PUBREC or PUBCOMP waiting for
+// mqttPipelined represents a PUBACK, PUBREC or PUBCOMP waiting for
 // JetStream to acknowledge the operations behind it.
-type mqttPipelinedResponse interface {
+type mqttPipelined interface {
 	respType() byte
 	packetID() uint16
 
@@ -4642,15 +4642,15 @@ type mqttPipelinedPubAck struct {
 	done  chan error
 }
 
-func (r *mqttPipelinedPubAck) respType() byte        { return mqttPacketPubAck }
-func (r *mqttPipelinedPubAck) packetID() uint16      { return r.pi }
-func (r *mqttPipelinedPubAck) waitOn() [2]chan error { return [2]chan error{r.done} }
-func (r *mqttPipelinedPubAck) abandon(jsa *mqttJSA)  { jsa.replies.Delete(r.reply) }
+func (p *mqttPipelinedPubAck) respType() byte        { return mqttPacketPubAck }
+func (p *mqttPipelinedPubAck) packetID() uint16      { return p.pi }
+func (p *mqttPipelinedPubAck) waitOn() [2]chan error { return [2]chan error{p.done} }
+func (p *mqttPipelinedPubAck) abandon(jsa *mqttJSA)  { jsa.replies.Delete(p.reply) }
 
-func (r *mqttPipelinedPubAck) submit(jsa *mqttJSA, subject string, hdr int, msg []byte) {
-	r.reply = jsa.newReplySubject(mqttJSAMsgStore)
-	jsa.replies.Store(r.reply, r)
-	jsa.storeMsgAsync(subject, hdr, msg, _EMPTY_, r.reply)
+func (p *mqttPipelinedPubAck) submit(jsa *mqttJSA, subject string, hdr int, msg []byte) {
+	p.reply = jsa.newReplySubject(mqttJSAMsgStore)
+	jsa.replies.Store(p.reply, p)
+	jsa.storeMsgAsync(subject, hdr, msg, _EMPTY_, p.reply)
 }
 
 // A QoS2 PUBLISH's store to $MQTT_qos2in. With an exchange, the reply
@@ -4663,15 +4663,15 @@ type mqttPipelinedPubRec struct {
 	exchange *mqttQoS2Exchange
 }
 
-func (r *mqttPipelinedPubRec) respType() byte        { return mqttPacketPubRec }
-func (r *mqttPipelinedPubRec) packetID() uint16      { return r.pi }
-func (r *mqttPipelinedPubRec) waitOn() [2]chan error { return [2]chan error{r.done} }
-func (r *mqttPipelinedPubRec) abandon(jsa *mqttJSA)  { jsa.replies.Delete(r.reply) }
+func (p *mqttPipelinedPubRec) respType() byte        { return mqttPacketPubRec }
+func (p *mqttPipelinedPubRec) packetID() uint16      { return p.pi }
+func (p *mqttPipelinedPubRec) waitOn() [2]chan error { return [2]chan error{p.done} }
+func (p *mqttPipelinedPubRec) abandon(jsa *mqttJSA)  { jsa.replies.Delete(p.reply) }
 
-func (r *mqttPipelinedPubRec) submit(jsa *mqttJSA, subject string, hdr int, msg []byte) {
-	r.reply = jsa.newReplySubject(mqttJSAMsgStore)
-	jsa.replies.Store(r.reply, r)
-	jsa.storeMsgAsync(subject, hdr, msg, _EMPTY_, r.reply)
+func (p *mqttPipelinedPubRec) submit(jsa *mqttJSA, subject string, hdr int, msg []byte) {
+	p.reply = jsa.newReplySubject(mqttJSAMsgStore)
+	jsa.replies.Store(p.reply, p)
+	jsa.storeMsgAsync(subject, hdr, msg, _EMPTY_, p.reply)
 }
 
 // A PUBREL's delivery store to $MQTT_msgs and delete of the held copy from
@@ -4686,24 +4686,24 @@ type mqttPipelinedPubComp struct {
 	delDone    chan error
 }
 
-func (r *mqttPipelinedPubComp) respType() byte        { return mqttPacketPubComp }
-func (r *mqttPipelinedPubComp) packetID() uint16      { return r.pi }
-func (r *mqttPipelinedPubComp) waitOn() [2]chan error { return [2]chan error{r.storeDone, r.delDone} }
-func (r *mqttPipelinedPubComp) abandon(jsa *mqttJSA) {
-	jsa.replies.Delete(r.storeReply)
-	jsa.replies.Delete(r.delReply)
+func (p *mqttPipelinedPubComp) respType() byte        { return mqttPacketPubComp }
+func (p *mqttPipelinedPubComp) packetID() uint16      { return p.pi }
+func (p *mqttPipelinedPubComp) waitOn() [2]chan error { return [2]chan error{p.storeDone, p.delDone} }
+func (p *mqttPipelinedPubComp) abandon(jsa *mqttJSA) {
+	jsa.replies.Delete(p.storeReply)
+	jsa.replies.Delete(p.delReply)
 }
 
-func (r *mqttPipelinedPubComp) submitStore(jsa *mqttJSA, subject string, hdr int, msg []byte, heldSeq uint64) {
-	r.storeReply = jsa.newReplySubject(mqttJSAMsgStore)
-	jsa.replies.Store(r.storeReply, r)
-	jsa.storeMsgAsync(subject, hdr, msg, mqttQoS2DeliveryMsgId(heldSeq), r.storeReply)
+func (p *mqttPipelinedPubComp) submitStore(jsa *mqttJSA, subject string, hdr int, msg []byte, heldSeq uint64) {
+	p.storeReply = jsa.newReplySubject(mqttJSAMsgStore)
+	jsa.replies.Store(p.storeReply, p)
+	jsa.storeMsgAsync(subject, hdr, msg, mqttQoS2DeliveryMsgId(heldSeq), p.storeReply)
 }
 
-func (r *mqttPipelinedPubComp) submitDelete(jsa *mqttJSA, heldSeq uint64) {
-	r.delReply = jsa.newReplySubject(mqttJSAMsgDelete)
-	jsa.replies.Store(r.delReply, r)
-	jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, heldSeq, false, r.delReply)
+func (p *mqttPipelinedPubComp) submitDelete(jsa *mqttJSA, heldSeq uint64) {
+	p.delReply = jsa.newReplySubject(mqttJSAMsgDelete)
+	jsa.replies.Store(p.delReply, p)
+	jsa.deleteMsg(mqttQoS2IncomingMsgsStreamName, heldSeq, false, p.delReply)
 }
 
 // Idempotent, callable from any goroutine; unblocks a readLoop waiting in
@@ -4719,8 +4719,8 @@ func (pipe *mqttAckPipeline) shutdown() {
 	pipe.stop()
 	for {
 		select {
-		case r := <-pipe.q:
-			r.abandon(pipe.jsa)
+		case p := <-pipe.q:
+			p.abandon(pipe.jsa)
 		default:
 			return
 		}
@@ -4736,48 +4736,48 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 	t := time.NewTimer(time.Hour)
 	defer t.Stop()
 
-	fail := func(r mqttPipelinedResponse, err error) {
-		r.abandon(jsa)
-		c.Errorf("unable to store QoS1/2 message in JetStream (pi=%v): %v; closing the connection", r.packetID(), err)
+	fail := func(p mqttPipelined, err error) {
+		p.abandon(jsa)
+		c.Errorf("unable to store QoS1/2 message in JetStream (pi=%v): %v; closing the connection", p.packetID(), err)
 		c.closeConnection(ProtocolViolation)
 	}
 
 	for {
 		select {
-		case r := <-pipe.q:
+		case p := <-pipe.q:
 			t.Reset(jsa.timeout)
-			for _, done := range r.waitOn() {
+			for _, done := range p.waitOn() {
 				if done == nil {
 					continue
 				}
 				select {
 				case err := <-done:
 					if err != nil {
-						fail(r, err)
+						fail(p, err)
 						return
 					}
 
 				case <-t.C:
-					fail(r, fmt.Errorf("timeout after %v waiting for the JetStream ack", jsa.timeout))
+					fail(p, fmt.Errorf("timeout after %v waiting for the JetStream ack", jsa.timeout))
 					return
 
 				case <-pipe.quitCh:
 					// pipe.shutdown only covers entries still queued; this one
 					// is ours to clean up.
-					r.abandon(jsa)
+					p.abandon(jsa)
 					return
 
 				case <-s.quitCh:
 					// pipe.shutdown only covers entries still queued; this one
 					// is ours to clean up.
-					r.abandon(jsa)
+					p.abandon(jsa)
 					return
 				}
 			}
 			c.mu.Lock()
 			trace := c.trace
 			c.mu.Unlock()
-			c.mqttEnqueuePubResponse(r.respType(), r.packetID(), trace)
+			c.mqttEnqueuePubResponse(p.respType(), p.packetID(), trace)
 
 		case <-pipe.quitCh:
 			return
@@ -4791,9 +4791,9 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 // Stores a QoS1 PUBLISH to $MQTT_msgs; PUBACK on its ack. readLoop only.
 func (s *Server) mqttPipelineStoreAndPubAck(c *client, pi uint16, subject string, hdrLen int, natsMsg []byte) error {
 	jsa := c.mqtt.sess.jsa
-	r := &mqttPipelinedPubAck{pi: pi, done: make(chan error, 1)}
-	r.submit(jsa, subject, hdrLen, natsMsg)
-	return s.mqttPipelinePush(c, jsa, r)
+	p := &mqttPipelinedPubAck{pi: pi, done: make(chan error, 1)}
+	p.submit(jsa, subject, hdrLen, natsMsg)
+	return s.mqttPipelinePush(c, jsa, p)
 }
 
 // PUBACK with no store, through the pipeline to preserve ordering. readLoop only.
@@ -4804,28 +4804,28 @@ func (s *Server) mqttPipelinePubAck(c *client, pi uint16) error {
 // Stores a QoS2 PUBLISH into $MQTT_qos2in; PUBREC on its ack. readLoop only.
 func (s *Server) mqttPipelineHoldAndPubRec(c *client, pi uint16, subject string, hdrLen int, natsMsg []byte, exchange *mqttQoS2Exchange) error {
 	jsa := c.mqtt.sess.jsa
-	r := &mqttPipelinedPubRec{pi: pi, done: make(chan error, 1), exchange: exchange}
-	r.submit(jsa, subject, hdrLen, natsMsg)
-	return s.mqttPipelinePush(c, jsa, r)
+	p := &mqttPipelinedPubRec{pi: pi, done: make(chan error, 1), exchange: exchange}
+	p.submit(jsa, subject, hdrLen, natsMsg)
+	return s.mqttPipelinePush(c, jsa, p)
 }
 
 // Submits the delivery store and the seq-addressed delete concurrently;
 // PUBCOMP on both acks. readLoop only.
 func (s *Server) mqttPipelineReleaseAndPubComp(c *client, pi uint16, heldSeq uint64, subject string, hdrLen int, natsMsg []byte) error {
 	jsa := c.mqtt.sess.jsa
-	r := &mqttPipelinedPubComp{pi: pi, storeDone: make(chan error, 1), delDone: make(chan error, 1)}
-	r.submitDelete(jsa, heldSeq)
-	r.submitStore(jsa, subject, hdrLen, natsMsg, heldSeq)
-	return s.mqttPipelinePush(c, jsa, r)
+	p := &mqttPipelinedPubComp{pi: pi, storeDone: make(chan error, 1), delDone: make(chan error, 1)}
+	p.submitDelete(jsa, heldSeq)
+	p.submitStore(jsa, subject, hdrLen, natsMsg, heldSeq)
+	return s.mqttPipelinePush(c, jsa, p)
 }
 
 // For a PUBREL whose message was dropped: no store, PUBCOMP still gated on
 // the delete. readLoop only.
 func (s *Server) mqttPipelineDeleteAndPubComp(c *client, pi uint16, heldSeq uint64) error {
 	jsa := c.mqtt.sess.jsa
-	r := &mqttPipelinedPubComp{pi: pi, delDone: make(chan error, 1)}
-	r.submitDelete(jsa, heldSeq)
-	return s.mqttPipelinePush(c, jsa, r)
+	p := &mqttPipelinedPubComp{pi: pi, delDone: make(chan error, 1)}
+	p.submitDelete(jsa, heldSeq)
+	return s.mqttPipelinePush(c, jsa, p)
 }
 
 // PUBCOMP with no store or delete, through the pipeline to preserve
@@ -4839,7 +4839,7 @@ func (s *Server) mqttPipelinePubComp(c *client, pi uint16) error {
 func (s *Server) mqttPipelineStart(c *client, jsa *mqttJSA) *mqttAckPipeline {
 	pipe := &mqttAckPipeline{
 		jsa:    jsa,
-		q:      make(chan mqttPipelinedResponse, mqttMaxAcksInFlight),
+		q:      make(chan mqttPipelined, mqttMaxAcksInFlight),
 		quitCh: make(chan struct{}),
 	}
 	if !s.startGoRoutine(func() {
@@ -4856,7 +4856,7 @@ func (s *Server) mqttPipelineStart(c *client, jsa *mqttJSA) *mqttAckPipeline {
 }
 
 // Admits an entry, creating the pipeline on first use. readLoop only.
-func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, r mqttPipelinedResponse) error {
+func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, p mqttPipelined) error {
 	// The field is readLoop-owned (we are the readLoop), no lock.
 	pipe := c.mqtt.acks
 	if pipe == nil {
@@ -4864,7 +4864,7 @@ func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, r mqttPipelinedRespon
 			// Server is shutting down, complete synchronously.
 			t := time.NewTimer(jsa.timeout)
 			defer t.Stop()
-			for _, done := range r.waitOn() {
+			for _, done := range p.waitOn() {
 				if done == nil {
 					continue
 				}
@@ -4874,60 +4874,60 @@ func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, r mqttPipelinedRespon
 						return err
 					}
 				case <-t.C:
-					r.abandon(jsa)
+					p.abandon(jsa)
 					return fmt.Errorf("no JetStream ack within %v during server shutdown", jsa.timeout)
 				case <-s.quitCh:
 					// The reply may never come; do not hold up the shutdown.
-					r.abandon(jsa)
+					p.abandon(jsa)
 					return ErrServerNotRunning
 				}
 			}
 			c.mu.Lock()
 			trace := c.trace
 			c.mu.Unlock()
-			c.mqttEnqueuePubResponse(r.respType(), r.packetID(), trace)
+			c.mqttEnqueuePubResponse(p.respType(), p.packetID(), trace)
 			return nil
 		}
 		c.mqtt.acks = pipe
 	}
 
-	return pipe.push(r)
+	return pipe.push(p)
 }
 
 // Admits an entry into the pipeline. Rejects it once the pipeline is
 // stopped: an entry admitted after the connection-close drain
 // (mqttHandleClosedClient -> pipe.shutdown) would strand its reply
 // registration in the account-scoped jsa.replies. readLoop only.
-func (pipe *mqttAckPipeline) push(r mqttPipelinedResponse) error {
+func (pipe *mqttAckPipeline) push(p mqttPipelined) error {
 	jsa := pipe.jsa
 	select {
 	case <-pipe.quitCh:
-		r.abandon(jsa)
+		p.abandon(jsa)
 		return errMQTTAckPipelineStopped
 	default:
 	}
 
 	enqueued := false
 	select {
-	case pipe.q <- r:
+	case pipe.q <- p:
 		enqueued = true
 	default:
 		// Window full: wait for an available slot in the pipeline.
 		t := time.NewTimer(jsa.timeout)
 		defer t.Stop()
 		select {
-		case pipe.q <- r:
+		case pipe.q <- p:
 			enqueued = true
 		case <-pipe.quitCh:
 		case <-t.C:
-			r.abandon(jsa)
+			p.abandon(jsa)
 			return fmt.Errorf("in-flight window full (%d packets), no JetStream ack for the oldest within %v",
 				mqttMaxAcksInFlight, jsa.timeout)
 		}
 	}
 	if !enqueued {
 		// Stopped while waiting for a slot, never admitted.
-		r.abandon(jsa)
+		p.abandon(jsa)
 		return errMQTTAckPipelineStopped
 	}
 
