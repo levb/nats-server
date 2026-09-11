@@ -6408,9 +6408,8 @@ func TestMQTTQoS2RejectPublishDuplicatesAcrossReconnect(t *testing.T) {
 	testMQTTReadPIPacket(mqttPacketPubRec, t, rp, pubPI)
 	cp.Close()
 
-	// Reconnect the session and retransmit with the same PI (DUP set) but a
-	// different payload. [MQTT-4.3.3-1]: the first accepted bytes must win,
-	// as in TestMQTTQoS2RejectPublishDuplicates on one connection.
+	// Retransmit (DUP set) with a different payload after a reconnect: the
+	// first accepted bytes must win [MQTT-4.3.3-1].
 	cp, rp = testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
 	defer cp.Close()
 	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, true)
@@ -10506,10 +10505,8 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 	}
 }
 
-// QoS2 acknowledgments flow through the same ack pipeline as QoS1: a burst
-// of PUBLISH packets gets its PUBRECs back in publish order, a burst of
-// PUBRELs its PUBCOMPs in the same order, and every message is delivered
-// exactly once.
+// A burst of PUBLISHes gets its PUBRECs in order, a burst of PUBRELs its
+// PUBCOMPs in order, and every message is delivered exactly once.
 func TestMQTTQoS2AckPipelineOrder(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10551,9 +10548,8 @@ func TestMQTTQoS2AckPipelineOrder(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// Closing the connection with pipelined QoS2 exchanges still in flight must
-// not panic, hang, or leak JSA reply registrations, and a successor
-// connection must complete a full exchange cleanly.
+// An abrupt close with QoS2 exchanges in flight must not panic, hang, or
+// leak JSA reply registrations, and a successor connection must work.
 func TestMQTTQoS2AckPipelineConnClose(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10573,19 +10569,16 @@ func TestMQTTQoS2AckPipelineConnClose(t *testing.T) {
 	for pi := uint16(1); pi <= numMsgs; pi++ {
 		testMQTTSendPublishPacket(t, mcp, 2, false, false, "foo", pi, []byte(fmt.Sprintf("msg-%d", pi)))
 	}
-	// A PUBREL follows its own PUBREC [MQTT-4.3.3-1], so read those before
-	// releasing. Everything after them is left unread, which is what the
-	// abrupt close below is meant to strand.
+	// Read the PUBRECs before releasing [MQTT-4.3.3-1]; everything after is
+	// left unread for the abrupt close to strand.
 	for pi := uint16(1); pi <= numMsgs/2; pi++ {
 		testMQTTReadPIPacket(mqttPacketPubRec, t, mpr, pi)
 	}
 	for pi := uint16(1); pi <= numMsgs/2; pi++ {
 		testMQTTSendPIPacket(mqttPacketPubRel|0x2, t, mcp, pi)
 	}
-	// inMsgs counts broadcasts, and a QoS2 PUBLISH does not broadcast (it
-	// only holds) - the PUBREL-initiated deliveries do. The PUBRELs were
-	// written after all the PUBLISHes on the same connection, so all of
-	// them delivered implies every packet above was processed.
+	// inMsgs counts broadcasts, which only the PUBRELs cause; all of them
+	// delivered implies every packet above was processed.
 	pc := testMQTTGetClient(t, s, "pub")
 	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
 		if n := atomic.LoadInt64(&pc.inMsgs); n < numMsgs/2 {
@@ -10628,10 +10621,8 @@ func TestMQTTQoS2AckPipelineConnClose(t *testing.T) {
 	testMQTTCheckPubMsgNoAck(t, mcs, msr, "foo", mqttPubQos1, []byte("fresh"))
 }
 
-// A corrupt held message (no Nmqtt-Pub header) must fail the connection
-// on PUBREL - never be acknowledged or delivered - but also be discarded,
-// so the PUBREL the client retries on its next connection converges to a
-// clean PUBCOMP instead of re-loading the same message every time.
+// A corrupt held message (no Nmqtt-Pub header) fails the connection on
+// PUBREL and is discarded, so the retried PUBREL converges to a bare PUBCOMP.
 func TestMQTTQoS2PubRelInvalidHeldMessage(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10655,10 +10646,8 @@ func TestMQTTQoS2PubRelInvalidHeldMessage(t *testing.T) {
 	defer mc.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
-	// Plant a message with no MQTT headers where the held copy for pi
-	// would live.
-	// The $-prefixed inbox keeps this connection's JS API replies out of
-	// the MQTT '#' subscription: wildcards must not match $-topics.
+	// The $-prefixed inbox keeps the JS API replies out of the MQTT '#'
+	// subscription: wildcards must not match $-topics.
 	nc := natsConnect(t, s.ClientURL(), nats.CustomInboxPrefix("$TESTINBOX"))
 	defer nc.Close()
 	js, err := nc.JetStream()
@@ -10699,11 +10688,9 @@ func TestMQTTQoS2PubRelInvalidHeldMessage(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// Reusing a packet identifier for a new publication after its previous
-// exchange was released must deliver every message exactly once: the
-// released mark of the old exchange must not short-circuit the new one,
-// and the new message must not dedupe against the old exchange's held
-// copy, whose asynchronous discard may still be in flight.
+// Reusing a PI after its exchange was released delivers every message
+// exactly once: the old released mark must not short-circuit the new
+// exchange, nor the new message dedupe against the old copy.
 func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10719,9 +10706,7 @@ func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 	defer mcp.Close()
 	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
 
-	// Full compliant exchanges back-to-back on the same PI: each PUBCOMP
-	// legally releases the PI for the next publication, typically while
-	// the previous held copy's discard is still in flight.
+	// Back-to-back exchanges on one PI; each PUBCOMP frees it for the next.
 	const pi = uint16(1)
 	const cycles = 10
 	for i := 1; i <= cycles; i++ {
@@ -10739,13 +10724,9 @@ func TestMQTTQoS2PIReuseAfterRelease(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// A PUBREL retransmitted on a reconnect, here to the same server, must not
-// deliver the message to QoS1+ subscribers a second time, even while the
-// held copy's discard is still in flight. The new connection has no
-// in-memory state for the exchange, falls back to the JetStream load, finds
-// the undeleted copy and re-stores it - and that store carries the same
-// message id as the first, so JetStream drops it. Same guarantee as the
-// cross-server case (TestMQTTQoS2CrossServerRetransmitDeduped), by design.
+// A PUBREL retransmitted after a same-server reconnect, while the discard
+// is still in flight, re-stores under the same message id and is deduped:
+// QoS1+ subscribers see the message once. Same guarantee as cross-server.
 func TestMQTTQoS2SameServerRetransmitDeduped(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10798,12 +10779,9 @@ func TestMQTTQoS2SameServerRetransmitDeduped(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// The cross-server half of window D. A PUBREL retransmitted on a different
-// server has no released mark to consult, so it resolves the exchange by
-// loading the held copy, which is still there while the discard is in
-// flight. The delivery it then stores carries the same message id as the
-// first one, derived from that copy's sequence, so JetStream drops it and
-// the subscriber sees the message exactly once.
+// A PUBREL retransmitted to another server, while the discard is still in
+// flight, loads the held copy and re-stores under the same message id, so
+// JetStream drops it and the subscriber sees the message once.
 func TestMQTTQoS2CrossServerRetransmitDeduped(t *testing.T) {
 	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplaceNoLeaf(), "MQTT", 2)
 	defer cl.shutdown()
@@ -10863,9 +10841,7 @@ func TestMQTTQoS2CrossServerRetransmitDeduped(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// Only QoS2 deliveries carry a message id. If QoS1 publishes carried one the
-// dedup map would hold an entry per message on the busiest path, and if QoS2
-// deliveries did not the cross-server retransmit would go unrecognized.
+// Only QoS2 deliveries carry a message id.
 func TestMQTTQoS2DeliveryMsgIdOnlyForQoS2(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10912,11 +10888,7 @@ func TestMQTTQoS2DeliveryMsgIdOnlyForQoS2(t *testing.T) {
 	}
 }
 
-// A PUBREL is sent only in response to a PUBREC [MQTT-4.3.3-1]. One that
-// arrives before its PUBREC leaves the held copy's sequence unknown, so
-// there is no message id for the delivery and nothing to address the
-// discard to, and the connection is failed rather than carrying machinery
-// to resolve the sequence afterwards.
+// A PUBREL arriving before its PUBREC [MQTT-4.3.3-1] fails the connection.
 func TestMQTTQoS2PubRelBeforePubRecFailsConn(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -10947,12 +10919,9 @@ func TestMQTTQoS2PubRelBeforePubRecFailsConn(t *testing.T) {
 	}
 }
 
-// A PUBLISH whose copy is already in $MQTT_qos2in from a previous
-// connection, retransmitted without the DUP flag so a fresh exchange is
-// recorded for it. Its hold store is deduped by the stream, which yields no
-// sequence, so the exchange is marked unconfirmed and the PUBREL resolves
-// from the stream instead of being rejected as premature. The message must
-// be delivered exactly once and the connection must survive.
+// A PUBLISH retransmitted without DUP, whose copy is already in the stream:
+// the new exchange's store is deduped and yields no sequence, so the PUBREL
+// resolves from the stream instead of being rejected. Delivered once.
 func TestMQTTQoS2RetransmitWithoutDupResolvesFromStream(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -11004,12 +10973,8 @@ func testMQTTQoS2HeldCount(t *testing.T, s *Server) uint64 {
 	return mset.state().Msgs
 }
 
-// The invariant items 1+2 of the correctness plan buy: a PUBCOMP the
-// client receives proves the held copy was durably discarded, so a
-// PUBREL retransmitted on a later connection (a lost PUBCOMP, from the
-// client's point of view) finds nothing to load and cannot deliver a
-// duplicate. The stream is checked immediately after each PUBCOMP - no
-// polling: the PUBCOMP is gated on the discard's JetStream ack.
+// A received PUBCOMP proves the held copy is gone: the stream is checked
+// right after each one, no polling, since PUBCOMP is gated on the discard.
 func TestMQTTQoS2PubCompImpliesDiscard(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -11053,11 +11018,9 @@ func TestMQTTQoS2PubCompImpliesDiscard(t *testing.T) {
 	testMQTTExpectNothing(t, msr)
 }
 
-// A PUBREL for an exchange held by a previous connection: the released
-// mark died with that connection, so the delivery comes from the
-// JetStream fallback load - the only dup-candidate path - and its
-// discard uses the sequence the load returned. The retransmitted PUBREL
-// on the same connection is then screened by the released mark.
+// A PUBREL for a copy held by a previous connection is delivered from the
+// fallback load, and a retransmit on this connection is screened by the
+// released mark.
 func TestMQTTQoS2FallbackLoadDelivery(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
