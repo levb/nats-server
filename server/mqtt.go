@@ -2110,15 +2110,15 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 		case *mqttPipelinedPubRec:
 			pa := value.(*JSPubAckResponse)
 			err := pa.ToError()
-			if to.exchange != nil {
-				if err == nil && pa.PubAck != nil {
-					to.exchange.seq.Store(pa.Sequence)
-				} else if mqttIsMaxMsgsPerSubjectErr(err) {
-					// Deduped by the stream (a retransmitted PUBLISH): no
-					// sequence, the PUBREL loads the copy. The error still
-					// clears in except.
+			if mqttIsMaxMsgsPerSubjectErr(err) {
+				// Deduped by the stream (a retransmitted PUBLISH), still owed
+				// its PUBREC. No sequence came back; the PUBREL loads the copy.
+				if to.exchange != nil {
 					to.exchange.seq.Store(mqttQoS2SeqUnconfirmed)
 				}
+				err = nil
+			} else if err == nil && pa.PubAck != nil && to.exchange != nil {
+				to.exchange.seq.Store(pa.Sequence)
 			}
 			to.done <- err
 		case *mqttPipelinedPubComp:
@@ -4634,8 +4634,6 @@ type mqttPipelinedResponse interface {
 	// The reply channels, in order; nil where there is no operation. Each
 	// is buffered(1) and completed at most once.
 	waitOn() [2]chan error
-	// Translates a leg's error; a benign one comes back nil.
-	except(err error) error
 	// Removes the reply registrations from the account-scoped jsa.replies,
 	// which outlives the connection; every give-up path must call this.
 	abandon(jsa *mqttJSA)
@@ -4649,11 +4647,10 @@ type mqttPipelinedPubAck struct {
 	done  chan error
 }
 
-func (r *mqttPipelinedPubAck) respType() byte         { return mqttPacketPubAck }
-func (r *mqttPipelinedPubAck) packetID() uint16       { return r.pi }
-func (r *mqttPipelinedPubAck) waitOn() [2]chan error  { return [2]chan error{r.done} }
-func (r *mqttPipelinedPubAck) except(err error) error { return err }
-func (r *mqttPipelinedPubAck) abandon(jsa *mqttJSA)   { jsa.replies.Delete(r.reply) }
+func (r *mqttPipelinedPubAck) respType() byte        { return mqttPacketPubAck }
+func (r *mqttPipelinedPubAck) packetID() uint16      { return r.pi }
+func (r *mqttPipelinedPubAck) waitOn() [2]chan error { return [2]chan error{r.done} }
+func (r *mqttPipelinedPubAck) abandon(jsa *mqttJSA)  { jsa.replies.Delete(r.reply) }
 
 func (r *mqttPipelinedPubAck) submit(jsa *mqttJSA, subject string, hdr int, msg []byte) {
 	r.reply = jsa.newReplySubject(mqttJSAMsgStore)
@@ -4676,15 +4673,6 @@ func (r *mqttPipelinedPubRec) packetID() uint16      { return r.pi }
 func (r *mqttPipelinedPubRec) waitOn() [2]chan error { return [2]chan error{r.done} }
 func (r *mqttPipelinedPubRec) abandon(jsa *mqttJSA)  { jsa.replies.Delete(r.reply) }
 
-// A max-msgs-per-subject rejection is $MQTT_qos2in deduping a retransmitted
-// PUBLISH, still owed its PUBREC.
-func (r *mqttPipelinedPubRec) except(err error) error {
-	if mqttIsMaxMsgsPerSubjectErr(err) {
-		return nil
-	}
-	return err
-}
-
 func (r *mqttPipelinedPubRec) submit(jsa *mqttJSA, subject string, hdr int, msg []byte) {
 	r.reply = jsa.newReplySubject(mqttJSAMsgStore)
 	jsa.replies.Store(r.reply, r)
@@ -4703,10 +4691,9 @@ type mqttPipelinedPubComp struct {
 	delDone    chan error
 }
 
-func (r *mqttPipelinedPubComp) respType() byte         { return mqttPacketPubComp }
-func (r *mqttPipelinedPubComp) packetID() uint16       { return r.pi }
-func (r *mqttPipelinedPubComp) waitOn() [2]chan error  { return [2]chan error{r.storeDone, r.delDone} }
-func (r *mqttPipelinedPubComp) except(err error) error { return err }
+func (r *mqttPipelinedPubComp) respType() byte        { return mqttPacketPubComp }
+func (r *mqttPipelinedPubComp) packetID() uint16      { return r.pi }
+func (r *mqttPipelinedPubComp) waitOn() [2]chan error { return [2]chan error{r.storeDone, r.delDone} }
 func (r *mqttPipelinedPubComp) abandon(jsa *mqttJSA) {
 	jsa.replies.Delete(r.storeReply)
 	jsa.replies.Delete(r.delReply)
@@ -4773,7 +4760,7 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 				}
 				select {
 				case err := <-done:
-					if err = r.except(err); err != nil {
+					if err != nil {
 						fail(r, err)
 						return
 					}
@@ -4891,7 +4878,7 @@ func (s *Server) mqttPipelinePush(c *client, jsa *mqttJSA, r mqttPipelinedRespon
 				}
 				select {
 				case err := <-done:
-					if err = r.except(err); err != nil {
+					if err != nil {
 						return err
 					}
 				case <-t.C:
