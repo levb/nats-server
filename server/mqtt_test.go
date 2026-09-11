@@ -10449,7 +10449,7 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 		jsa := &mqttJSA{timeout: time.Second}
 		pipe := &mqttAckPipeline{
 			jsa:    jsa,
-			q:      make(chan *mqttPipelinedAck, 4),
+			q:      make(chan mqttPipelinedResponse, 4),
 			quitCh: make(chan struct{}),
 		}
 
@@ -10458,7 +10458,7 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 			// The readLoop side: register, admit until rejected.
 			defer close(done)
 			for n := 0; ; n++ {
-				ack := &mqttPipelinedAck{pi: uint16(n%0xFFFF + 1), reply: fmt.Sprintf("reply.%d", n), done: make(chan error, 1)}
+				ack := &mqttPipelinedPubAck{pi: uint16(n%0xFFFF + 1), reply: fmt.Sprintf("reply.%d", n), done: make(chan error, 1)}
 				jsa.replies.Store(ack.reply, func(any) {})
 				if err := pipe.push(ack); err != nil {
 					return
@@ -10470,7 +10470,7 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 		// concurrently with the pushes, as the connection-close handler
 		// does.
 		for j := 0; j < i%4; j++ {
-			ack := <-pipe.q
+			ack := (<-pipe.q).(*mqttPipelinedPubAck)
 			jsa.replies.Delete(ack.reply)
 		}
 		pipe.shutdown()
@@ -10488,11 +10488,11 @@ func TestMQTTQoS1PubAckPipelineShutdownRace(t *testing.T) {
 	jsa := &mqttJSA{timeout: time.Second}
 	pipe := &mqttAckPipeline{
 		jsa:    jsa,
-		q:      make(chan *mqttPipelinedAck, 4),
+		q:      make(chan mqttPipelinedResponse, 4),
 		quitCh: make(chan struct{}),
 	}
 	pipe.shutdown()
-	ack := &mqttPipelinedAck{pi: 1, reply: "reply.stopped", done: make(chan error, 1)}
+	ack := &mqttPipelinedPubAck{pi: 1, reply: "reply.stopped", done: make(chan error, 1)}
 	jsa.replies.Store(ack.reply, func(any) {})
 	if err := pipe.push(ack); err != errMQTTAckPipelineStopped {
 		t.Fatalf("Expected errMQTTAckPipelineStopped, got %v", err)
