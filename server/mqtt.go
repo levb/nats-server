@@ -4312,7 +4312,7 @@ func (s *Server) mqttHandleWill(c *client) {
 		pp.flags |= mqttPubFlagRetain
 	}
 	c.mu.Unlock()
-	s.mqttInitiateMsgDelivery(c, pp)
+	s.mqttInitiateMsgDelivery(c, pp, 0)
 	c.flushClients(0)
 }
 
@@ -4547,7 +4547,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 
 	switch qos {
 	case 0:
-		return s.mqttInitiateMsgDelivery(c, pp)
+		return s.mqttInitiateMsgDelivery(c, pp, 0)
 
 	case 1:
 		// [MQTT-4.3.2-2]. Initiate onward delivery of the Application Message,
@@ -4560,7 +4560,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		//
 		// The PUBACK is emitted by the pipeline once JetStream acks the
 		// store, in the order the PUBLISH packets were received.
-		return s.mqttInitiateMsgDelivery(c, pp)
+		return s.mqttInitiateMsgDelivery(c, pp, 0)
 
 	case 2:
 		// [MQTT-4.3.3-2]. Method A, Store message, send PUBREC.
@@ -4943,47 +4943,11 @@ func (pipe *mqttAckPipeline) push(p mqttPipelined) error {
 	return nil
 }
 
-func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
+// heldSeq is the $MQTT_qos2in sequence of a PUBREL delivery's held copy,
+// deleted alongside the store; zero otherwise.
+func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, heldSeq uint64) error {
 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false)
 
-	subject, permIssue := c.mqttBroadcast(pp, natsMsg, headerLen)
-	if permIssue {
-		// The message was dropped, but the client may still be owed a
-		// PUBACK (routed through the pipeline to preserve ordering).
-		if pp.owesPubAck() {
-			return s.mqttPipelinePubAck(c, pp.pi)
-		}
-		return nil
-	}
-
-	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
-	// JetStream under "$MQTT.msgs.<delivery-subject>"
-	if qos := mqttGetQoS(pp.flags); qos == 0 {
-		return nil
-	}
-
-	// We need to call flushClients now since this we may have called c.addToPCD
-	// with destination clients (possibly a route). Without calling flushClients
-	// the following call may then be stuck waiting for a reply that may never
-	// come because the destination is not flushed (due to c.out.fsp > 0,
-	// see addToPCD and writeLoop for details).
-	c.flushClients(0)
-
-	// QoS1 from the wire is pipelined; wills owe no PUBACK and store
-	// synchronously. PUBREL deliveries take mqttProcessPubRel's path.
-	if pp.owesPubAck() {
-		return s.mqttPipelineStoreAndPubAck(c, pp.pi, subject, headerLen, natsMsg)
-	}
-
-	_, err := c.mqtt.sess.jsa.storeMsg(subject, headerLen, natsMsg)
-
-	return err
-}
-
-// Broadcasts an inbound message into NATS. Returns the "$MQTT.msgs.>"
-// subject to store it under, read from c.pa after the broadcast since
-// mappings may rewrite it, or permIssue if it was dropped. readLoop only.
-func (c *client) mqttBroadcast(pp *mqttPublish, natsMsg []byte, headerLen int) (storeSubject string, permIssue bool) {
 	// The delivered message becomes the client's current publish (it is not
 	// the last PARSED packet for a PUBREL- or will-initiated delivery), and
 	// c.pa carries its pubargs; one defer restores both. c.mqtt.pp is
@@ -5009,10 +4973,47 @@ func (c *client) mqttBroadcast(pp *mqttPublish, natsMsg []byte, headerLen int) (
 		c.pa.szb = nil
 	}()
 
-	if _, permIssue = c.processInboundClientMsg(natsMsg); permIssue {
-		return _EMPTY_, true
+	_, permIssue := c.processInboundClientMsg(natsMsg)
+	if permIssue {
+		// The message was dropped, but the client may still be owed a
+		// PUBACK or a PUBCOMP (routed through the pipeline to preserve
+		// ordering); the PUBCOMP stays gated on the delete.
+		if heldSeq > 0 {
+			return s.mqttPipelineDeleteAndPubComp(c, pp.pi, heldSeq)
+		}
+		if pp.owesPubAck() {
+			return s.mqttPipelinePubAck(c, pp.pi)
+		}
+		return nil
 	}
-	return mqttStreamSubjectPrefix + string(c.pa.subject), false
+
+	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
+	// JetStream under "$MQTT.msgs.<delivery-subject>"
+	if qos := mqttGetQoS(pp.flags); qos == 0 {
+		return nil
+	}
+
+	// We need to call flushClients now since this we may have called c.addToPCD
+	// with destination clients (possibly a route). Without calling flushClients
+	// the following call may then be stuck waiting for a reply that may never
+	// come because the destination is not flushed (due to c.out.fsp > 0,
+	// see addToPCD and writeLoop for details).
+	c.flushClients(0)
+
+	subject := mqttStreamSubjectPrefix + string(c.pa.subject)
+
+	// PUBREL deliveries and QoS1 from the wire are pipelined; wills owe no
+	// PUBACK and store synchronously.
+	if heldSeq > 0 {
+		return s.mqttPipelineReleaseAndPubComp(c, pp.pi, heldSeq, subject, headerLen, natsMsg)
+	}
+	if pp.owesPubAck() {
+		return s.mqttPipelineStoreAndPubAck(c, pp.pi, subject, headerLen, natsMsg)
+	}
+
+	_, err := c.mqtt.sess.jsa.storeMsg(subject, headerLen, natsMsg)
+
+	return err
 }
 
 var mqttMaxMsgErrPattern = fmt.Sprintf("%s (%v)", ErrMaxMsgsPerSubject.Error(), JSStreamStoreFailedF)
@@ -5078,16 +5079,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// retransmits racing it are screened by the released mark.
 	c.mqttMarkQoS2Released(pi)
 
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false)
-	subject, permIssue := c.mqttBroadcast(pp, natsMsg, headerLen)
-	if permIssue {
-		// Still owed the PUBCOMP, gated on the delete.
-		return s.mqttPipelineDeleteAndPubComp(c, pi, heldSeq)
-	}
-
-	// See mqttInitiateMsgDelivery for the flush before the store.
-	c.flushClients(0)
-	return s.mqttPipelineReleaseAndPubComp(c, pi, heldSeq, subject, headerLen, natsMsg)
+	return s.mqttInitiateMsgDelivery(c, pp, heldSeq)
 }
 
 // Loads the held QoS2 message for pi and its sequence; (nil, 0, nil) when
