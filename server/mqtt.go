@@ -4738,7 +4738,7 @@ func (s *Server) mqttAckLoop(c *client, pipe *mqttAckPipeline, jsa *mqttJSA) {
 
 	fail := func(p mqttPipelined, err error) {
 		p.abandon(jsa)
-		c.Errorf("unable to store QoS1/2 message in JetStream (pi=%v): %v; closing the connection", p.packetID(), err)
+		c.Errorf("JetStream failed a pipelined QoS1/2 operation (pi=%v): %v; closing the connection", p.packetID(), err)
 		c.closeConnection(ProtocolViolation)
 	}
 
@@ -4814,8 +4814,8 @@ func (s *Server) mqttPipelineHoldAndPubRec(c *client, pi uint16, subject string,
 func (s *Server) mqttPipelineReleaseAndPubComp(c *client, pi uint16, heldSeq uint64, subject string, hdrLen int, natsMsg []byte) error {
 	jsa := c.mqtt.sess.jsa
 	p := &mqttPipelinedPubComp{pi: pi, storeDone: make(chan error, 1), delDone: make(chan error, 1)}
-	p.submitDelete(jsa, heldSeq)
 	p.submitStore(jsa, subject, hdrLen, natsMsg, heldSeq)
+	p.submitDelete(jsa, heldSeq)
 	return s.mqttPipelinePush(c, jsa, p)
 }
 
@@ -5037,7 +5037,7 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 //
 // Runs from the client's readLoop. No lock held on entry.
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
-	exchange, released := c.mqttTakeQoS2Publish(pi)
+	exchange, released := c.mqttGetQoS2Publish(pi)
 	// A retransmission: a load could still see the async-deleted copy
 	// [MQTT-4.3.3-1].
 	if released {
@@ -5188,7 +5188,7 @@ func (c *client) mqttRecordQoS2Publish(pp *mqttPublish) *mqttQoS2Exchange {
 }
 
 // (nil, false) means unknown here: fall back to the load. readLoop only.
-func (c *client) mqttTakeQoS2Publish(pi uint16) (exchange *mqttQoS2Exchange, released bool) {
+func (c *client) mqttGetQoS2Publish(pi uint16) (exchange *mqttQoS2Exchange, released bool) {
 	if exchange, held := c.mqtt.qos2Exchanges[pi]; held {
 		return exchange, false
 	}
