@@ -417,18 +417,10 @@ type mqtt struct {
 	// Pipelines PUBACK/PUBREC/PUBCOMP for inbound QoS1/2 packets. readLoop-owned.
 	acks *mqttAckPipeline
 
-	// Inbound QoS2 state, readLoop-owned. A PI is in at most one of the two.
-	// Consulted before JetStream, which is stale while async stores and
-	// deletes are in flight; a miss falls back to the load.
-	//
-	// qos2Exchanges: pending exchanges, each the held copy (dedups duplicate
-	// PUBLISHes, delivered on PUBREL) plus its $MQTT_qos2in sequence.
-	// qos2Released: PIs whose PUBREL was processed; a retransmit gets a bare
-	// PUBCOMP [MQTT-4.3.3-1], a new PUBLISH clears the mark.
-	//
-	// Both die with the connection: a reconnect resolves a retransmitted
-	// PUBREL from the stream, and the delivery's message id suppresses a
-	// second delivery.
+	// The source of truth for inbound QoS2 messages while the async
+	// JetStream operations are in flight: qos2Exchanges caches the pending
+	// ones, qos2Released the PIs whose PUBREL was processed. A PI missing
+	// from both falls back to JetStream. readLoop-owned.
 	qos2Exchanges map[uint16]*mqttQoS2Exchange
 	qos2Released  avl.SequenceSet
 
