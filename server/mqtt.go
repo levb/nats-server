@@ -4586,9 +4586,12 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 
 // Max pipelined inbound QoS1/2 packets per connection (the server's
 // effective "Receive Maximum"). A full window blocks the readLoop,
-// backpressuring the client. Also caps the held QoS2 message copies kept
-// in memory (see client.mqttRecordQoS2Publish).
-const mqttMaxAcksInFlight = 1024
+// backpressuring the client.
+const mqttMaxPipelined = 1024
+
+// Max QoS2 PUBLISH copies cached in memory per connection, between PUBREC
+// and PUBREL; past this the PUBREL loads from the stream.
+const mqttMaxCachedQoS2Msgs = 1024
 
 // A QoS>0 PUBLISH must carry a non-zero PI, Spec [MQTT-2.3.1-1];
 // mqttParsePub zeroes pi for QoS0 and synthesized messages (wills) carry
@@ -4839,7 +4842,7 @@ func (s *Server) mqttPipelinePubComp(c *client, pi uint16) error {
 func (s *Server) mqttPipelineStart(c *client, jsa *mqttJSA) *mqttAckPipeline {
 	pipe := &mqttAckPipeline{
 		jsa:    jsa,
-		q:      make(chan mqttPipelined, mqttMaxAcksInFlight),
+		q:      make(chan mqttPipelined, mqttMaxPipelined),
 		quitCh: make(chan struct{}),
 	}
 	if !s.startGoRoutine(func() {
@@ -4922,7 +4925,7 @@ func (pipe *mqttAckPipeline) push(p mqttPipelined) error {
 		case <-t.C:
 			p.abandon(jsa)
 			return fmt.Errorf("in-flight window full (%d packets), no JetStream ack for the oldest within %v",
-				mqttMaxAcksInFlight, jsa.timeout)
+				mqttMaxPipelined, jsa.timeout)
 		}
 	}
 	if !enqueued {
@@ -4943,8 +4946,6 @@ func (pipe *mqttAckPipeline) push(p mqttPipelined) error {
 	return nil
 }
 
-// heldSeq is the $MQTT_qos2in sequence of a PUBREL delivery's held copy,
-// deleted alongside the store; zero otherwise.
 func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, heldSeq uint64) error {
 	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false)
 
@@ -5031,12 +5032,10 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 	return mqttQoS2IncomingMsgsStreamSubjectPrefix + c.mqtt.cid + "." + strconv.FormatUint(uint64(pi), 10)
 }
 
-// Process a PUBREL (QoS2, acting as Receiver): deliver the held message
-// [MQTT-4.3.3-2], delete its copy by sequence, and PUBCOMP once both are
-// acked. Delivered from the qos2Exchanges copy, else loaded, unless the
-// exchange is released (a retransmission).
+// Process a PUBREL (QoS2, acting as Receiver).
 //
-// Runs from the client's readLoop. No lock held on entry.
+// Runs from the client's readLoop.
+// No lock held on entry.
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	exchange, released := c.mqttGetQoS2Publish(pi)
 	// A retransmission: a load could still see the async-deleted copy
@@ -5054,9 +5053,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 			// so a zero means the client jumped the flow.
 			return fmt.Errorf("QoS2 PUBREL (pi=%v) received before its PUBREC was sent", pi)
 		case mqttQoS2SeqUnconfirmed:
-			// Deduped against a copy already in the stream: resolve from
-			// there, and drop the entry so a bare PUBCOMP below cannot
-			// leave it to shadow the PI's next PUBLISH.
+			// The store was deduped: use the copy in the stream.
 			delete(c.mqtt.qos2Exchanges, pi)
 			exchange = nil
 		default:
@@ -5071,12 +5068,8 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		if pp == nil {
 			return s.mqttPipelinePubComp(c, pi)
 		}
-		// Expected only on session resumptions.
-		c.Debugf("Delivering QoS2 PUBREL (pi=%v) from a JetStream load; the message was held by a previous connection", pi)
 	}
 
-	// Seq-addressed, so the delete cannot hit a successor on a reused PI;
-	// retransmits racing it are screened by the released mark.
 	c.mqttMarkQoS2Released(pi)
 
 	return s.mqttInitiateMsgDelivery(c, pp, heldSeq)
@@ -5090,8 +5083,9 @@ func (c *client) mqttLoadHeldQoS2Msg(pi uint16) (*mqttPublish, uint64, error) {
 		if IsNatsErr(err, JSNoMessageFoundErr) {
 			return nil, 0, nil
 		}
-		// A failed load says nothing about the copy; a PUBCOMP would
-		// strand it.
+		// The copy may still be held. A PUBCOMP now would end the
+		// exchange on the client side, and nothing else ever delivers
+		// the copy; failing the connection gets the PUBREL retransmitted.
 		return nil, 0, fmt.Errorf("unable to load the held QoS2 message (pi=%v): %v", pi, err)
 	}
 
@@ -5143,10 +5137,9 @@ type mqttQoS2Exchange struct {
 	seq atomic.Uint64
 }
 
-// Keeps a copy of a QoS2 PUBLISH (the slices point into the readLoop
-// buffer) for its PUBREL. A released mark is cleared first: a PUBLISH on a
-// released PI is a new publication [MQTT-4.3.3-1]. Returns nil when no
-// copy is kept; the PUBREL then loads from the stream. readLoop only.
+// Copies the PUBLISH so that the PUBREL can deliver it without a JetStream
+// load. Returns nil if we decide not to keep one, in which case the PUBREL will
+// load the message from the stream. readLoop only.
 func (c *client) mqttRecordQoS2Publish(pp *mqttPublish) *mqttQoS2Exchange {
 	m := c.mqtt
 	if _, held := m.qos2Exchanges[pp.pi]; held {
@@ -5163,12 +5156,14 @@ func (c *client) mqttRecordQoS2Publish(pp *mqttPublish) *mqttQoS2Exchange {
 		return nil
 	}
 
-	if len(m.qos2Exchanges) >= mqttMaxAcksInFlight {
+	if len(m.qos2Exchanges) >= mqttMaxCachedQoS2Msgs {
 		return nil
 	}
 	if m.qos2Exchanges == nil {
 		m.qos2Exchanges = make(map[uint16]*mqttQoS2Exchange)
 	}
+
+	// Copy the slices since they point to the readLoop's buffer.
 	cp := *pp
 	cp.topic = append([]byte(nil), pp.topic...)
 	cp.subject = append([]byte(nil), pp.subject...)
